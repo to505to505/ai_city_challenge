@@ -151,26 +151,24 @@ The same `HafniaDataset.from_name("...")` call returns the sample dataset
 locally and the full dataset under Training-aaS, so the training script
 itself does not change between environments.
 
-### Option A — public trainer package (no code)
+### Bring your own trainer package
 
-For common tasks Hafnia ships ready-made trainers. To launch one:
+We do not use the public no-code trainers for this challenge — every run
+goes through a custom trainer package we control end-to-end.
 
-1. Sign in to the Hafnia platform and open the experiments dashboard.
-2. Click **Create Experiment**, pick your dataset (or data recipe).
-3. Under **Trainer package**, open the **Public Trainers** tab and select
-   one — e.g. *Object Detection Trainer* (wraps RF-DETR, compatible with
-   COCO-style datasets).
-4. Set the training command (e.g. `python scripts/train.py`) and the
-   configuration tier (`Lite`, `Pro`, `Scale`).
-5. **Create Experiment** and monitor progress in the dashboard.
+> **Versioning rule — every change is a new trainer.**
+> Whenever you modify the trainer (new model, new loss, new augmentations,
+> dependency bump, hyperparameter sweep, etc.) create a **new** trainer
+> package whose name reflects what changed. Do **not** overwrite an
+> existing trainer with `hafnia trainer update` for a meaningful change —
+> that breaks reproducibility of past experiments.
+>
+> Naming convention: `<task>-<arch>-<change>-vN`, e.g.
+> `eccv-cross-city-rfdetr-focal-loss-v1`,
+> `eccv-cross-city-rfdetr-mosaic-aug-v2`. Use `update` only for trivial
+> non-behavioral fixes (typos, README inside the trainer, etc.).
 
-The default Object Detection trainer converges in ~4 hours on
-`midwest-vehicle-detection` at the `Lite` tier.
-
-### Option B — bring your own trainer package
-
-When you need a different model, custom loop, or your own metrics,
-package your project as a trainer ZIP and launch it like a public one.
+Package your project as a trainer ZIP and launch it on Training-aaS.
 
 Reference templates (read these — they document structure, expected
 entry points, and `HafniaLogger` integration):
@@ -185,7 +183,8 @@ CLI workflow:
 hafnia trainer create-zip .
 
 # One-shot: package + upload + launch
-hafnia trainer create .                                # upload only
+# IMPORTANT: pick a NEW name on every meaningful change to the trainer code
+hafnia trainer create .                                # upload only (new trainer)
 hafnia experiment create \
     --dataset eccv-cross-city \
     --trainer-path . \
@@ -194,7 +193,7 @@ hafnia experiment create \
 # Manage existing trainers
 hafnia trainer ls                                       # your trainers
 hafnia trainer ls --visibility public                   # public trainers
-hafnia trainer update <trainer-id> .                    # push a new version
+hafnia trainer update <trainer-id> .                    # ONLY for trivial, non-behavioral fixes
 hafnia trainer view-zip trainer.zip                     # inspect ZIP contents
 
 # Launch against an already-uploaded trainer

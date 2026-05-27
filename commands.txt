@@ -1,0 +1,55 @@
+# Hafnia — quick command cheatsheet
+# Run from the trainer project root (the folder containing Dockerfile + scripts/).
+# Remember: every meaningful trainer change = NEW trainer (don't `update` over old one).
+
+
+# === Trainer packages ===
+
+# А. Только залить трейнер на платформу (зип создаётся автоматически)
+hafnia trainer create .
+
+# Б. Залить + сразу запустить эксперимент одной командой
+hafnia experiment create \
+    --dataset eccv-cross-city \
+    --trainer-path . \
+    --cmd "python scripts/train.py --epochs 50"
+
+# Собрать trainer.zip локально (если хочешь грузить через веб-портал)
+hafnia trainer create-zip .
+
+# Посмотреть что лежит в trainer.zip
+hafnia trainer view-zip trainer.zip
+
+# Список своих и публичных трейнеров
+hafnia trainer ls
+hafnia trainer ls --visibility public
+
+# Запустить эксперимент на уже залитом трейнере (по id)
+hafnia experiment create --dataset eccv-cross-city --trainer-id <trainer-id>
+
+
+# === Локальная проверка перед заливкой ===
+
+# Собрать docker-образ как на платформе
+hafnia runc build-local trainer.zip
+
+# Запустить тот же образ локально на sample-датасете
+hafnia runc launch-local --dataset eccv-cross-city "python scripts/train.py"
+
+
+# === Датасеты ===
+
+# Принудительно перекачать датасет
+hafnia dataset download eccv-cross-city --force
+
+# Список доступных датасетов
+hafnia dataset ls
+
+
+# === Конфигурация / профиль ===
+
+hafnia configure                 # первичная настройка (API key + URL)
+hafnia profile ls                # все профили
+hafnia profile active            # текущий
+hafnia profile use <name>        # переключиться
+hafnia clear                     # удалить всю конфигурацию
