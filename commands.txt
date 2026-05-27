@@ -1,76 +1,60 @@
-# Hafnia — quick command cheatsheet
-# Run from the trainer project root (the folder containing Dockerfile + scripts/).
-# Remember: every meaningful trainer change = NEW trainer (don't `update` over old one).
+# Hafnia — quick command cheatsheet (web-upload workflow)
+#
+# Flow: собираем trainer.zip локально → грузим в дашборде через "Upload new".
+# Запуск самого эксперимента — только через веб-интерфейс на
+# https://hafnia.milestonesys.com/dashboard/training-aas/experiments
+#
+# Подробности см. trainer_instruction.txt и README.md §5.
 
 
-# === Trainer packages ===
+# === Сборка trainer.zip ===
 
-# А. Только залить трейнер на платформу (зип создаётся автоматически)
-hafnia trainer create .
-
-# Б. Залить + сразу запустить эксперимент одной командой
-hafnia experiment create \
-    --dataset eccv-cross-city \
-    --trainer-path . \
-    --cmd "python scripts/train.py --epochs 50"
-
-# Собрать trainer.zip локально (если хочешь грузить через веб-портал)
+# Собрать zip из корня проекта (там где Dockerfile). Применяет .hafniaignore.
+# Результат: trainer.zip рядом с исходниками.
 hafnia trainer create-zip .
 
-# Посмотреть что лежит в trainer.zip
+# Посмотреть что попало в trainer.zip (дерево файлов)
 hafnia trainer view-zip trainer.zip
 
-# Список своих и публичных трейнеров
-hafnia trainer ls
-hafnia trainer ls --visibility public
 
-# Запустить эксперимент на уже залитом трейнере (по id)
-hafnia experiment create --dataset eccv-cross-city --trainer-id <trainer-id>
+# === Локальная проверка перед заливкой (опционально, но рекомендуется) ===
 
-
-# === Выбор GPU / окружения ===
-# Доступные окружения (в твоём аккаунте):
-#   Lite   — 1 × NVIDIA T4 (16 GB VRAM),  4 CPU,  $0.82/h,  83 credits/h
-#   Scale  — 4 × NVIDIA T4 (64 GB VRAM),  48 CPU, $5.45/h, 546 credits/h
-# Тип GPU фиксирован (только T4). Scale = 4 карты, не более мощная — код должен уметь multi-GPU (DDP/accelerate).
-
-# Посмотреть актуальный список окружений
-hafnia experiment environments
-
-# 1 × T4 — дешёво, для отладки
-hafnia experiment create \
-    -d eccv-cross-city \
-    -p . \
-    -e Lite \
-    -c "python scripts/train.py --epochs 5"
-
-# 4 × T4 — полноценная тренировка
-hafnia experiment create \
-    -d eccv-cross-city \
-    -p . \
-    -e Scale \
-    -c "python scripts/train.py --epochs 50"
-
-
-
-
-
-# === Локальная проверка перед заливкой ===
-
-# Собрать docker-образ как на платформе
+# Собрать docker-образ ровно как платформа собирает
 hafnia runc build-local trainer.zip
 
 # Запустить тот же образ локально на sample-датасете
-hafnia runc launch-local --dataset eccv-cross-city "python scripts/train.py"
+hafnia runc launch-local --dataset eccv-cross-city "python scripts/train.py --epochs 1"
+
+# Альтернатива — собрать и запустить через docker вручную с симуляцией cloud:
+#   DOCKER_BUILDKIT=0 docker build -t rfdetr_eccv:local .
+#   docker run --rm --gpus all \
+#       -e HAFNIA_CLOUD=true \
+#       -v $PWD/.data/datasets/eccv-cross-city:/opt/ml/input/data/training:ro \
+#       rfdetr_eccv:local python scripts/train.py --epochs 1
 
 
 # === Датасеты ===
 
-# Принудительно перекачать датасет
+# Скачать sample-датасет локально (для локальной отладки)
 hafnia dataset download eccv-cross-city --force
 
 # Список доступных датасетов
 hafnia dataset ls
+
+
+# === Просмотр трейнеров и экспериментов ===
+
+# Список моих trainer packages (после загрузки в дашборде видны и тут)
+hafnia trainer ls
+
+# Публичные трейнеры платформы (мы их не используем, но для справки)
+hafnia trainer ls --visibility public
+
+# Список запущенных / завершённых экспериментов
+hafnia experiment ls
+
+# Доступные окружения (Lite / Scale) с ценами
+hafnia experiment environments
 
 
 # === Конфигурация / профиль ===

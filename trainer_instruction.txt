@@ -1,0 +1,391 @@
+================================================================================
+ Hafnia Training-aaS — детальная инструкция по запуску своего трейнера
+================================================================================
+
+Эта инструкция описывает ВСЁ что я выяснил пока поднимал rfdetr_large_base на
+платформе. Включая грабли на которых уже наступили — чтобы не наступать второй раз.
+
+
+--------------------------------------------------------------------------------
+0. КЛЮЧЕВЫЕ ФАКТЫ ПРО ПЛАТФОРМУ (то что нигде явно не написано)
+--------------------------------------------------------------------------------
+
+* Платформа собирает Docker из твоего trainer.zip, потом запускает контейнер
+  командой которую ты передал в --cmd.
+* Перед запуском --cmd платформа вызывает свой bootstrap-скрипт
+  `/opt/ml/input/data/bootstrap/entrypoint.sh`, который **ДЕЛАЕТ `cd /opt/recipe`**.
+  Если у тебя WORKDIR другой — bootstrap упадёт с "No such file or directory".
+* Датасет (полный, hidden) платформа МОНТИРУЕТ в контейнер на путь
+  `/opt/ml/input/data/training` (или то что лежит в `$MDI_DATASET_DIR`).
+  Скачивать через `HafniaDataset.from_name(...)` в облаке НЕ нужно и НЕ работает —
+  там нет API-ключа.
+* Платформа выставляет env-var `HAFNIA_CLOUD=true` — по ней определяй cloud vs local.
+* HafniaLogger при `HAFNIA_CLOUD=true` пишет:
+    - чекпоинты в  /opt/ml/checkpoints  (или $MDI_CHECKPOINT_DIR)
+    - финальную модель в  /opt/ml/model  (или $MDI_MODEL_DIR)
+    - артефакты в  /opt/ml/output/data  (или $MDI_ARTIFACT_DIR)
+* Логи в /opt/ml/checkpoints автоматически собираются и доступны в дашборде.
+* "experiment_monitoring_url" в API часто = None. Это нормально, смотри логи через
+  /api/v1/experiments/<id>/logs или в дашборде.
+* Build-фаза занимает ~3-7 минут (apt + pip install — кэша между запусками нет).
+* **ВАЖНО — Network isolation.** Контейнер при тренировке НЕ имеет outbound в интернет.
+  Доступен ТОЛЬКО VPC-эндпоинт платформы для MLflow
+  (`http://vpce-...amazonaws.com`). Симптом: `urlopen error [Errno 99] Cannot
+  assign requested address`. Это значит:
+    - wandb.ai НЕ работает (логи MLflow → дашборд Hafnia вместо этого).
+    - HuggingFace Hub / pip install в runtime НЕ работают.
+    - Любые pretrained-веса нужно **ВКЛЮЧАТЬ В trainer.zip**
+      (например `weights/rf-detr-large-2026.pth`), а не качать на лету.
+
+
+--------------------------------------------------------------------------------
+1. ОБЯЗАТЕЛЬНАЯ СТРУКТУРА trainer.zip
+--------------------------------------------------------------------------------
+
+Hafnia валидирует что в zip есть ТРИ вещи (см. hafnia/platform/builder.py):
+
+    ├── src/         <- обязательно (твой код, может быть пустая папка-заглушка)
+    ├── scripts/     <- обязательно (entry-point скрипты)
+    └── Dockerfile   <- обязательно
+
+Без этих трёх — trainer.zip не примут на платформе.
+
+Наш текущий layout:
+
+    /home/dsa/hafnia/
+    ├── Dockerfile
+    ├── requirements.txt
+    ├── .hafniaignore         (что НЕ класть в zip)
+    ├── src/
+    │   └── eccv_trainer/__init__.py   (заглушка чтобы прошёл валидатор)
+    ├── scripts/
+    │   └── train.py          (точка входа)
+    ├── configs/
+    │   └── rfdetr_large_eccv.yaml
+    └── rf-detr/              (vendored RF-DETR source — папка, не submodule)
+
+
+--------------------------------------------------------------------------------
+2. DOCKERFILE — ШАБЛОН
+--------------------------------------------------------------------------------
+
+КРИТИЧНО: WORKDIR должен быть /opt/recipe.
+
+    FROM pytorch/pytorch:2.5.1-cuda12.1-cudnn9-runtime
+
+    ENV TRAINER_PACKAGE_DIR=/opt/recipe \
+        PYTHONDONTWRITEBYTECODE=1 \
+        PYTHONUNBUFFERED=1 \
+        PIP_NO_CACHE_DIR=1
+    WORKDIR $TRAINER_PACKAGE_DIR        # ← без этого entrypoint платформы упадёт
+
+    RUN apt-get update && apt-get install -y --no-install-recommends \
+            git libgl1 libglib2.0-0 \
+        && rm -rf /var/lib/apt/lists/*
+
+    COPY requirements.txt ./requirements.txt
+    RUN pip install --upgrade pip && pip install -r ./requirements.txt
+
+    # Если есть vendored библиотека — копируем + ставим editable:
+    COPY rf-detr ./rf-detr
+    RUN pip install -e "./rf-detr[train]"
+
+    COPY src ./src
+    COPY scripts ./scripts
+    COPY configs ./configs
+
+    ENV PYTHONPATH=${TRAINER_PACKAGE_DIR}/src:${TRAINER_PACKAGE_DIR}/rf-detr/src
+
+    CMD ["python", "scripts/train.py"]    # дефолт; платформа всё равно перебивает через --cmd
+
+
+--------------------------------------------------------------------------------
+3. ENTRY-POINT СКРИПТ — ШАБЛОН
+--------------------------------------------------------------------------------
+
+В тренировочном скрипте обязательно проверяй cloud vs local:
+
+    from hafnia.dataset.hafnia_dataset import HafniaDataset
+    from hafnia.experiment import HafniaLogger
+    from hafnia.utils import is_hafnia_cloud_job, get_dataset_path_in_hafnia_cloud
+
+    if is_hafnia_cloud_job():
+        # Cloud: датасет уже примонтирован, грузим с диска
+        dataset = HafniaDataset.from_path(get_dataset_path_in_hafnia_cloud())
+    else:
+        # Local: качаем sample dataset через API (нужен hafnia configure)
+        dataset = HafniaDataset.from_name("eccv-cross-city", version="1.0.0")
+
+    logger = HafniaLogger(project_name="...")
+    output_dir = str(logger.path_model_checkpoints())   # это /opt/ml/checkpoints в cloud
+
+ВАЖНО:
+* НЕ используй `HafniaDataset.from_name(...)` без обёртки is_hafnia_cloud_job() —
+  в облаке это сразу свалится с "No active profile configured".
+* Сохраняй чекпоинты в `logger.path_model_checkpoints()`, иначе платформа их
+  не подберёт.
+
+
+--------------------------------------------------------------------------------
+4. .hafniaignore — ЧТО НЕ ПОЛОЖИТЬ В ZIP
+--------------------------------------------------------------------------------
+
+Дефолтные исключения hafnia (если нет .hafniaignore): *.jpg, *.png, *.pyc,
+__pycache__, .data, .git, .venv, .vscode, trainer.zip, tests, wandb.
+
+Минимальный .hafniaignore для нашего репо:
+
+    # Дефолты + проектные
+    *.jpg
+    *.png
+    .data
+    .git
+    __pycache__
+    trainer.zip
+
+    visualization/
+    README.md
+    commands.txt
+    .gitignore
+
+    # Баласт vendored библиотеки
+    rf-detr/docs/
+    rf-detr/notebooks/
+    rf-detr/tests/
+
+Цель — держать zip < 50 MB. Иначе долгая загрузка + долгий билд.
+
+
+--------------------------------------------------------------------------------
+5. КАК ЗАПУСКАТЬ — СБОРКА ЛОКАЛЬНО + ЗАГРУЗКА ЧЕРЕЗ ВЕБ-ИНТЕРФЕЙС
+--------------------------------------------------------------------------------
+
+Используем именно этот flow (CLI experiment create пока отложен).
+
+### Шаг 1. Собрать trainer.zip локально
+
+Из корня проекта (там где Dockerfile):
+
+  hafnia trainer create-zip .
+  hafnia trainer view-zip trainer.zip   # опционально — посмотреть что внутри
+
+  → `trainer.zip` появится в корне (у нас сейчас ~131 MB,
+     130 MB из которых — bundled pretrained-веса).
+
+`.hafniaignore` контролирует что попадает в zip (gitignore-синтаксис).
+
+### Шаг 2. Залить через веб-дашборд
+
+  1. https://hafnia.milestonesys.com/  → войти.
+  2. Слева в меню: Training-aaS → Experiments
+     (или прямая: https://hafnia.milestonesys.com/dashboard/training-aas/experiments)
+  3. Кнопка "Create Experiment".
+  4. Data source: Dataset → eccv-cross-city → version 1.0.0
+  5. Trainer package:
+       - выбрать "Upload new" (НЕ "Or select existing")
+       - browse → /home/dsa/hafnia/trainer.zip
+       - имя трейнера: ОСМЫСЛЕННОЕ + по правилу версионирования (см. §8),
+         напр. eccv-rfdetr-large-base-v1
+       - дождаться окончания загрузки
+  6. Training command: python scripts/train.py --epochs 50
+  7. Environment / Tier:
+        Lite   1 × NVIDIA T4 (16 GB),  4 CPU,  $0.82/h
+        Scale  4 × NVIDIA T4 (64 GB), 48 CPU,  $5.45/h
+              (хочешь 4 GPU — код должен уметь DDP/accelerate)
+  8. Experiment name: что-то конкретное, напр. rfdetr_large_base
+  9. Create Experiment.
+
+После загрузки сам trainer package остаётся в списке организации, его
+можно переиспользовать в следующих экспериментах через "Or select
+existing trainer package" (без повторной загрузки 131 MB).
+
+
+--------------------------------------------------------------------------------
+6. WANDB / СЕКРЕТЫ
+--------------------------------------------------------------------------------
+
+У платформы НЕТ механизма секретов через CLI. Передавай WANDB_API_KEY inline в --cmd:
+
+  hafnia experiment create ... \
+      -c "WANDB_API_KEY=<KEY> python scripts/train.py --epochs 50 --wandb"
+
+ВНИМАНИЕ: ключ будет виден в:
+  • метадате эксперимента
+  • логах build/train на платформе
+  • локальной shell-истории
+
+→ После запуска СРАЗУ revoke + create new на https://wandb.ai/settings.
+   Или используй `WANDB_MODE=anonymous` без ключа (публичная ссылка на 7 дней).
+
+
+--------------------------------------------------------------------------------
+7. ЛОКАЛЬНАЯ ОТЛАДКА ПЕРЕД ЗАЛИВКОЙ
+--------------------------------------------------------------------------------
+
+  # 1. Собери ровно так как платформа
+  hafnia trainer create-zip .                    # → .data/trainers/hafnia_DATETIME.zip
+  hafnia runc build-local .data/trainers/<zip>   # билдит Docker как платформа
+
+  # 2. Запусти образ локально с симуляцией cloud-окружения
+  docker run --rm --gpus all \
+      -e HAFNIA_CLOUD=true \
+      -e WANDB_MODE=disabled \
+      -v $PWD/.data/datasets/<DATASET>:/opt/ml/input/data/training:ro \
+      <image>:latest \
+      python scripts/train.py --epochs 1
+
+  # Альтернатива: runc launch-local (но он сам разрулит маунты)
+  hafnia runc launch-local --dataset eccv-cross-city "python scripts/train.py --epochs 1"
+
+ВАЖНО: при локальной отладке используется SAMPLE dataset (300 картинок),
+полный hidden-датасет недоступен. Это значит:
+  • метрики на sample-валидации очень шумные
+  • поведение скрипта на 1 эпохе обычно достаточно проверить
+  • OOM-проблемы могут не воспроизвестись если sample меньше full
+
+
+--------------------------------------------------------------------------------
+8. ПРАВИЛО ВЕРСИОНИРОВАНИЯ
+--------------------------------------------------------------------------------
+
+Каждое СОДЕРЖАТЕЛЬНОЕ изменение трейнера (новый model, новый loss, новые
+аугментации, hyperparam sweep) = НОВЫЙ trainer package с говорящим именем.
+
+  hafnia trainer create .   ← создаёт НОВЫЙ trainer (новый UUID)
+  hafnia trainer update <id> .   ← перезаписывает существующий, ИСПОЛЬЗОВАТЬ
+                                   ТОЛЬКО для тривиальных правок (типо/README
+                                   внутри трейнера). Иначе теряется
+                                   воспроизводимость прошлых экспериментов.
+
+Соглашение имени: <task>-<arch>-<change>-vN
+  eccv-rfdetr-large-base-v1
+  eccv-rfdetr-large-focal-loss-v2
+  eccv-rfdetr-large-mosaic-aug-v3
+
+
+--------------------------------------------------------------------------------
+9. КАК ДЕБАЖИТЬ FAILED ЭКСПЕРИМЕНТ
+--------------------------------------------------------------------------------
+
+Через CLI:
+  hafnia experiment ls
+
+Через API (если в UI не видно или нужны сырые логи):
+
+  python -c "
+  from hafnia_cli.config import Config
+  from hafnia import http
+  cfg = Config()
+  exp_id = '<UUID>'
+  # Сам эксперимент:
+  print(http.fetch(cfg.config.platform_url + f'/api/v1/experiments/{exp_id}',
+                   headers={'Authorization': cfg.api_key}))
+  # Логи:
+  logs = http.fetch(cfg.config.platform_url + f'/api/v1/experiments/{exp_id}/logs?order=asc&limit=1000',
+                    headers={'Authorization': cfg.api_key})
+  for l in sorted(logs, key=lambda x: x['created_at']):
+      print(l['created_at'][11:23], l['step'], l['raw_message'])
+  "
+
+API-эндпоинты:
+  GET /api/v1/experiments/<id>                  ← state, error, timings
+  GET /api/v1/experiments/<id>/logs?order=asc   ← логи (поделены на BuildStep / TrainStep)
+
+Поля интереса в ответе:
+  state                    STARTED / TRAINING_IN_PROGRESS / TRAINING_FAILED / COMPLETED
+  error                    причина падения (часто 'AlgorithmError: , exit code: 1' — иди в логи)
+  training_started_at      когда контейнер реально стартанул
+  training_duration_seconds
+  credits_consumed         сколько кредитов сожгло
+
+Полезные query-параметры /logs (проверены экспериментально):
+  ?order=asc                       логи от начала, по возрастанию времени (default desc)
+  ?limit=N                         до N строк (фактический cap на сервере = 1000)
+  ?after=2026-05-27T13:50:00Z      ИСКЛЮЧИТЕЛЬНО логи позже указанного timestamp
+                                   (единственный фильтр который реально работает для tail)
+  ?step=BuildStep | ?step=TrainStep  отфильтровать по шагу
+
+Не работают (сервер их игнорирует): ?from=, ?to=, ?offset=, ?ordering=
+
+КАК ОТМЕНИТЬ / УДАЛИТЬ ЭКСПЕРИМЕНТ:
+CLI команды НЕТ. Варианты:
+  1. UI: дашборд → эксперимент → кнопка Cancel (отменяет, сохраняет логи)
+  2. API DELETE — УДАЛЯЕТ ЗАПИСЬ ЦЕЛИКОМ (логи, артефакты, всё):
+       python -c "
+       from hafnia_cli.config import Config; from hafnia import http
+       cfg = Config()
+       http.delete(cfg.config.platform_url + '/api/v1/experiments/<UUID>',
+                   headers={'Authorization': cfg.api_key})
+       "
+  3. API PATCH с {state: CANCELED} — возможно тоже работает (вернул 200 в моих тестах),
+     детальнее не проверял.
+
+
+--------------------------------------------------------------------------------
+10. ГРАБЛИ НА КОТОРЫЕ УЖЕ НАСТУПИЛИ
+--------------------------------------------------------------------------------
+
+[1] HafniaDataset.from_name(...) в облаке
+    Симптом: "No active profile configured" → exit 1, ~3 минуты.
+    Фикс: обернуть в `if is_hafnia_cloud_job(): from_path(...)`.
+
+[2] WORKDIR /workspace в Dockerfile
+    Симптом: "/opt/recipe: No such file or directory" в TrainStep, ~4 минуты.
+    Фикс: WORKDIR /opt/recipe + все COPY туда.
+
+[3] Слишком крупный trainer.zip
+    Симптом: долгий upload, build таймаутит.
+    Фикс: .hafniaignore + проверь `hafnia trainer view-zip <zip>`.
+
+[4] OOM на T4 16 GB при RF-DETR Large 704x704
+    Симптом: контейнер падает в начале первой эпохи.
+    Фикс: batch_size=1, grad_accum_steps=16, multi_scale=False.
+
+[5] Ключи в --cmd
+    Любой WANDB_API_KEY / прочий секрет в --cmd попадает в метадату навсегда.
+    Сразу после запуска — revoke и create new.
+
+[6] Pretrained-веса качаются с интернета
+    Симптом: контейнер падает при инициализации модели с "Cannot assign requested
+    address" или "Connection refused", через 5-10 минут после старта.
+    Фикс: положи веса локально в weights/, COPY в Dockerfile, передай
+    pretrain_weights="/opt/recipe/weights/<file>.pth" в конструктор модели.
+    (RF-DETR пропускает download если файл уже существует по этому пути.)
+
+[7] wandb в облачном запуске
+    Симптом: wandb.init() висит / падает с network error, метрик в wandb-дашборде нет.
+    Фикс: не передавай --wandb в cloud-run. HafniaLogger всё равно пишет в MLflow
+    платформы через VPC, метрики появятся в Hafnia-дашборде.
+
+
+--------------------------------------------------------------------------------
+11. БЫСТРЫЙ ЧЕКЛИСТ ПЕРЕД hafnia experiment create
+--------------------------------------------------------------------------------
+
+  [ ] Dockerfile: WORKDIR /opt/recipe (не /workspace, не /app)
+  [ ] scripts/train.py: проверка is_hafnia_cloud_job() на ветвлении from_name/from_path
+  [ ] HafniaLogger.path_model_checkpoints() используется как output_dir
+  [ ] src/, scripts/, Dockerfile — все три на месте
+  [ ] .hafniaignore исключает .data/, .git/, visualization/, README.md
+  [ ] requirements.txt включает hafnia, torch, rfdetr-зависимости
+  [ ] Все pretrained-веса лежат в weights/, и Dockerfile их COPY (network isolation!)
+  [ ] Скрипт передаёт pretrain_weights=<абсолютный путь> в модель
+  [ ] Локально через `docker run -e HAFNIA_CLOUD=true -v <sample>:/opt/ml/input/data/training`
+      пробежала ХОТЯ БЫ 1 эпоха без ошибок
+  [ ] Имя эксперимента осмысленное (-n rfdetr_large_focal_v3)
+  [ ] --wandb НЕ передан в облачную --cmd (в облаке wandb недоступен)
+
+
+--------------------------------------------------------------------------------
+12. РЕФЕРЕНСЫ
+--------------------------------------------------------------------------------
+
+  Дашборд:        https://hafnia.milestonesys.com/dashboard/training-aas/experiments
+  Доки:           https://hafnia.readme.io/docs/welcome-to-hafnia
+  SDK исходник:   https://github.com/milestone-hafnia/hafnia
+  Reference trainers:
+    https://github.com/milestone-hafnia/trainer-classification
+    https://github.com/milestone-hafnia/trainer-object-detection   ← очень полезный
+  Локально SDK:   /home/dsa/miniconda3/lib/python3.13/site-packages/hafnia/
+  Конфиг профиля: ~/.hafnia/config.json
+================================================================================

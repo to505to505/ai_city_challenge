@@ -1,0 +1,18 @@
+# Hafnia SDK — datasets + experiment tracking
+hafnia>=0.7.9
+
+# RF-DETR is installed from the local ./rf-detr folder via the Dockerfile.
+# Listing its runtime deps explicitly so `pip install -r requirements.txt` also works.
+torch>=2.2.0,<2.11
+torchvision>=0.17.0
+transformers>=5.1.0,<6.0.0
+pytorch_lightning>=2.6,<3,!=2.6.2,!=2.6.3
+torchmetrics[detection]>=1.2
+supervision>=0.20
+pydantic>=2.0
+pyDeprecate
+peft
+pycocotools
+albumentations
+tensorboard
+wandb

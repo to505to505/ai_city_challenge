@@ -1,0 +1,37 @@
+# Files excluded from trainer.zip (hafnia trainer create / create-zip).
+# Patterns follow .gitignore syntax.
+
+# Defaults from hafnia.utils.DEFAULT_IGNORE_SPECIFICATION, kept explicit so we own the list.
+*.jpg
+*.png
+# (RF-DETR pretrain weight files live in weights/ — they MUST be included so the
+# offline platform can find them. .pth/.pt are NOT in the global ignore list.)
+*.py[cod]
+*_cache/
+**.egg-info/
+.data
+.git
+.venv
+.vscode
+__pycache__
+trainer.zip
+tests
+wandb
+
+# Project-specific
+visualization/
+.gitignore
+README.md
+commands.txt
+trainer_instruction.txt
+.monitor.py
+.monitor.log
+state.json
+
+# RF-DETR baggage we never need at training time
+rf-detr/docs/
+rf-detr/notebooks/
+rf-detr/tests/
+rf-detr/CHANGELOG.md
+rf-detr/CITATION.cff
+rf-detr/mkdocs.yaml

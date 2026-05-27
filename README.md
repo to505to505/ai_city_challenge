@@ -158,17 +158,14 @@ goes through a custom trainer package we control end-to-end.
 
 > **Versioning rule — every change is a new trainer.**
 > Whenever you modify the trainer (new model, new loss, new augmentations,
-> dependency bump, hyperparameter sweep, etc.) create a **new** trainer
-> package whose name reflects what changed. Do **not** overwrite an
-> existing trainer with `hafnia trainer update` for a meaningful change —
-> that breaks reproducibility of past experiments.
+> dependency bump, hyperparameter sweep, etc.) upload a **new** trainer
+> package whose name reflects what changed. Do not reuse the same trainer
+> name for behavioural changes — that breaks reproducibility of past
+> experiments.
 >
 > Naming convention: `<task>-<arch>-<change>-vN`, e.g.
-> `eccv-cross-city-rfdetr-focal-loss-v1`,
-> `eccv-cross-city-rfdetr-mosaic-aug-v2`. Use `update` only for trivial
-> non-behavioral fixes (typos, README inside the trainer, etc.).
-
-Package your project as a trainer ZIP and launch it on Training-aaS.
+> `eccv-rfdetr-large-base-v1`, `eccv-rfdetr-large-focal-loss-v2`,
+> `eccv-rfdetr-large-mosaic-aug-v3`.
 
 Reference templates (read these — they document structure, expected
 entry points, and `HafniaLogger` integration):
@@ -176,44 +173,55 @@ entry points, and `HafniaLogger` integration):
 - [`trainer-classification`](https://github.com/milestone-hafnia/trainer-classification) — image classification.
 - [`trainer-object-detection`](https://github.com/milestone-hafnia/trainer-object-detection) — RF-DETR wrapper for detection (a sensible starting point for this challenge).
 
-CLI workflow:
+### Workflow — build locally, upload via the web UI
+
+The flow we use is: build `trainer.zip` on this machine, then upload it
+through the Hafnia dashboard.
+
+**1. Build the zip locally**
+
+From the repo root (the folder with the `Dockerfile`):
 
 ```bash
-# Build trainer.zip from the current project
 hafnia trainer create-zip .
-
-# One-shot: package + upload + launch
-# IMPORTANT: pick a NEW name on every meaningful change to the trainer code
-hafnia trainer create .                                # upload only (new trainer)
-hafnia experiment create \
-    --dataset eccv-cross-city \
-    --trainer-path . \
-    --cmd "python scripts/train.py --epochs 50"        # package + upload + launch
-
-# Manage existing trainers
-hafnia trainer ls                                       # your trainers
-hafnia trainer ls --visibility public                   # public trainers
-hafnia trainer update <trainer-id> .                    # ONLY for trivial, non-behavioral fixes
-hafnia trainer view-zip trainer.zip                     # inspect ZIP contents
-
-# Launch against an already-uploaded trainer
-hafnia experiment create --dataset eccv-cross-city --trainer-id <trainer-id>
+hafnia trainer view-zip trainer.zip   # optional sanity check
 ```
 
-Trainer packages are visible to your whole organization — saved trainers
-can be reused by teammates.
+This walks the tree, applies the patterns in [`.hafniaignore`](.hafniaignore)
+(gitignore syntax), and writes `trainer.zip` next to the source.
 
-### Test the build locally (Docker)
+**2. Upload via the web dashboard**
 
-Before uploading, build the trainer in the same way the platform does
-and run it against a sample dataset:
+1. Sign in to <https://hafnia.milestonesys.com/>.
+2. Open **Training-aaS → Experiments** in the left menu (or go directly
+   to <https://hafnia.milestonesys.com/dashboard/training-aas/experiments>).
+3. Click **Create Experiment**.
+4. **Data source:** *Dataset* → `eccv-cross-city` v `1.0.0`.
+5. **Trainer package:** choose **Upload new**, browse to
+   `trainer.zip`, and give it a descriptive name following the versioning
+   rule above (e.g. `eccv-rfdetr-large-base-v1`). Wait for upload to finish.
+6. **Training command:** `python scripts/train.py --epochs 50`
+7. **Environment / Tier:** `Lite` (1 × T4).
+8. **Experiment name:** something concrete, e.g. `rfdetr_large_base`.
+9. Click **Create Experiment**.
+
+The platform builds the Docker image from your zip (~5 min), then runs
+the training command. Metrics show up in the dashboard via
+`HafniaLogger`/MLflow. Saved trainer packages can be re-used for future
+experiments from the **Or select existing trainer package** option.
+
+### Test the build locally (Docker, optional)
+
+Before uploading, build and run the trainer in the same way the platform
+does — useful for catching `Dockerfile` errors and missing deps before
+the platform spends time + credits on them:
 
 ```bash
 # Build the docker image from trainer.zip
 hafnia runc build-local trainer.zip
 
-# Run that image locally against a sample dataset
-hafnia runc launch-local --dataset eccv-cross-city "python scripts/train.py"
+# Run that image locally against the sample dataset
+hafnia runc launch-local --dataset eccv-cross-city "python scripts/train.py --epochs 1"
 ```
 
 This catches syntax errors, missing dependencies, and `Dockerfile`
@@ -261,24 +269,113 @@ recipe.as_platform_recipe(recipe_name="eccv-200-sample", overwrite=True)
 
 `hafnia recipe ls | create | rm` manages recipes on the platform.
 
-## 6. Repo layout
+## 6. RF-DETR Large trainer (this repo)
+
+This repository is laid out as a **Hafnia trainer package** that fine-tunes
+**RF-DETR Large** on `eccv-cross-city`. RF-DETR is vendored as a plain folder
+(`rf-detr/`, no `.git`) so we can patch it without dealing with submodules.
+
+### Files that matter
+
+- [`scripts/train.py`](scripts/train.py) — entry point. Pulls the dataset via
+  `HafniaDataset.from_name`, exports it once to a Roboflow-style COCO layout
+  in `.data/coco/eccv-cross-city/`, then runs `RFDETRLarge.train(...)`.
+- [`configs/rfdetr_large_eccv.yaml`](configs/rfdetr_large_eccv.yaml) — reference
+  config mirroring the same values; usable via `rfdetr fit --config ...` once
+  the COCO data has been materialized.
+- [`Dockerfile`](Dockerfile) — `pytorch/pytorch:2.5.1-cuda12.1-cudnn9` base,
+  installs `rf-detr[train]` from the local folder + `requirements.txt`.
+- [`requirements.txt`](requirements.txt) — Hafnia SDK + RF-DETR's runtime deps.
+- [`.hafniaignore`](.hafniaignore) — keeps `visualization/`, docs, notebooks,
+  and `.data/` out of `trainer.zip`.
+- [`rf-detr/`](rf-detr/) — vendored upstream source (`roboflow/rf-detr`).
+
+### Canonical RF-DETR Large settings
+
+| Setting             | Value | Why                                                        |
+| ------------------- | ----- | ---------------------------------------------------------- |
+| `num_classes`       | 10    | classes in `eccv-cross-city` (see §3)                      |
+| `resolution`        | 704   | RF-DETR Large default; must be divisible by `patch*windows = 32` |
+| `patch_size`        | 16    | architectural — do not change                              |
+| `num_windows`       | 2     | architectural — do not change                              |
+| `pretrain_weights`  | `rf-detr-large-2026.pth` | downloaded on first run by RF-DETR |
+| `dataset_file`      | `roboflow` | matches the layout `to_coco_format` writes             |
+| `batch_size × grad_accum` | 1 × 16 = 16 | effective per-device batch — safe for one T4 (16 GB)  |
+| `multi_scale` / `expanded_scales` | `false` | off for Lite (would push activations past 704 on T4); flip to `true` on Scale |
+
+### Logging
+
+Three independent layers, all written into the same run:
+
+| Layer            | Where                                            | How to enable                                     |
+| ---------------- | ------------------------------------------------ | ------------------------------------------------- |
+| `HafniaLogger`   | Hafnia experiments dashboard                     | Always on (created in `scripts/train.py`)         |
+| TensorBoard      | `events.out.tfevents.*` inside the checkpoint dir | `tensorboard=True` (default)                      |
+| W&B (optional)   | `wandb.ai/<your-team>/eccv-cross-city`           | Add `--wandb --run-name <name>` to the train cmd  |
+
+For W&B in the cloud, the container needs `WANDB_API_KEY` — pass it inline in the
+launch command (see [commands.txt](commands.txt)). RF-DETR's W&B logger is the
+PyTorch Lightning `WandbLogger`; HafniaLogger keeps working in parallel.
+
+### Augmentations
+
+Defined in [`scripts/train.py:AUG_CONFIG`](scripts/train.py). Conservative
+on geometry (mounted-camera footage, ground bias) and lean on photometric jitter:
+
+- `HorizontalFlip` — `p=0.5`
+- `RandomBrightnessContrast` — `±0.15`, `p=0.4`
+- `ColorJitter` — `±0.15` brightness/contrast/saturation, `±0.05` hue, `p=0.4`
+- `Affine` — scale `0.9–1.1`, ±5° rotation, ±5% translation, `p=0.3`
+
+No `VerticalFlip`, no heavy rotation — they'd break "vehicles sit on the road" priors.
+`multi_scale=True` and `expanded_scales=True` give native multi-resolution
+training on top of these.
+
+### How to run
+
+```bash
+# Local dry-run (uses the 300-image sample dataset, single T4)
+python scripts/train.py --epochs 3
+
+# Build the trainer.zip for upload
+hafnia trainer create-zip .
+```
+
+Then upload `trainer.zip` via the web dashboard (see §5 *Workflow — build
+locally, upload via the web UI*). On the platform, set the training
+command to `python scripts/train.py --epochs 50` and pick the `Lite`
+environment.
+
+Remember the versioning rule from §5: **every meaningful change → new trainer
+with a name that reflects what changed** (e.g. `eccv-rfdetr-large-aug-aerial-v1`).
+
+## 7. Repo layout
 
 ```
 .
 ├── README.md                          this file
+├── commands.txt                       hafnia CLI cheatsheet
+├── Dockerfile                         trainer-package container
+├── requirements.txt                   Hafnia SDK + RF-DETR runtime deps
+├── .hafniaignore                      excludes from trainer.zip
+├── configs/
+│   └── rfdetr_large_eccv.yaml         reference RF-DETR Large config
+├── scripts/
+│   └── train.py                       training entry point (called by Dockerfile)
+├── src/
+│   └── eccv_trainer/__init__.py       project package placeholder
+├── rf-detr/                           vendored roboflow/rf-detr source
 └── visualization/
-    ├── visualize.py                   reference script: loads the dataset,
-    │                                  draws bboxes, plots class/split stats
+    ├── visualize.py                   loads dataset, draws bboxes, plots stats
     ├── examples.png                   9 random annotated samples
     ├── class_distribution.png         per-class bbox counts (log scale)
     └── splits.png                     samples + bboxes per split
 ```
 
-`visualize.py` writes its outputs to `/home/dsa/hafnia/visualization/`
-(hardcoded for the original author's environment) — if you re-run it
-locally, fix those paths first.
+`visualize.py` writes its outputs to `visualization/` (absolute paths) — if
+you re-run it elsewhere, fix those paths first.
 
-## 7. Working notes / gotchas
+## 8. Working notes / gotchas
 
 - **Bboxes are normalized.** Multiply by image `W`, `H` before drawing or
   feeding into detectors that expect absolute coordinates.
@@ -293,7 +390,7 @@ locally, fix those paths first.
 - **Don't push raw imagery anywhere.** The licensing is privacy-bounded;
   the Hafnia TaaS flow is the supported way to train at scale.
 
-## 8. References
+## 9. References
 
 - AI City Challenge home: https://www.aicitychallenge.org/
 - Hafnia platform: https://hafnia.milestonesys.com/
@@ -304,4 +401,5 @@ locally, fix those paths first.
 - Reference trainer — classification: https://github.com/milestone-hafnia/trainer-classification
 - Reference trainer — object detection: https://github.com/milestone-hafnia/trainer-object-detection
 - Data library: https://hafnia.milestonesys.com/training-aas/datasets
+- RF-DETR: https://github.com/roboflow/rf-detr — docs: https://rfdetr.roboflow.com
 - ECCV 2026: https://eccv.ecva.net/

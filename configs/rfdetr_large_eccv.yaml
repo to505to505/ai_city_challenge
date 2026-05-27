@@ -1,0 +1,67 @@
+# Reference config for RF-DETR Large on eccv-cross-city.
+# `scripts/train.py` is the canonical entry point — it builds the COCO dataset from
+# HafniaDataset and instantiates the model in Python. This YAML mirrors the same
+# values so it can also be fed to `rfdetr fit --config configs/rfdetr_large_eccv.yaml`
+# IF the COCO data has already been materialized (see `scripts/train.py`).
+#
+# Hard requirements for RF-DETR Large (rfdetr/config.py::RFDETRLargeConfig):
+#   - patch_size: 16
+#   - num_windows: 2
+#   - resolution must be divisible by patch_size * num_windows = 32 → 704 ✓
+#
+# Native pretrained PE size = 704 // 16 = 44, so do not change resolution unless
+# you also update positional_encoding_size (the train() code handles that automatically).
+
+model:
+  model_config:
+    class_path: rfdetr.config.RFDETRLargeConfig
+    init_args:
+      num_classes: 10
+      resolution: 704
+  train_config:
+    class_path: rfdetr.config.TrainConfig
+    init_args:
+      dataset_dir: .data/coco/eccv-cross-city   # produced by scripts/train.py
+      dataset_file: roboflow
+      output_dir: output/rfdetr_large_eccv
+      epochs: 50
+      # Tuned for a single T4 (16 GB). For Scale (4 × T4): batch_size=2, grad_accum_steps=4,
+      # multi_scale=true, expanded_scales=true.
+      batch_size: 1
+      grad_accum_steps: 16                      # effective per-device batch = 16
+      lr: 1.0e-4
+      lr_encoder: 1.5e-4
+      num_workers: 2
+      use_ema: true
+      tensorboard: true
+      multi_scale: false                        # off for 16 GB T4 — would push activations past 704
+      expanded_scales: false
+      square_resize_div_64: true
+      class_names:
+        - Vehicle.Car
+        - Vehicle.Pickup Truck
+        - Vehicle.Single Truck
+        - Vehicle.Combo Truck
+        - Vehicle.Heavy Duty Vehicle
+        - Vehicle.Trailer
+        - Vehicle.Motorcycle
+        - Vehicle.Bicycle
+        - Vehicle.Van
+        - Person
+      aug_config:
+        HorizontalFlip: { p: 0.5 }
+        RandomBrightnessContrast:
+          brightness_limit: 0.15
+          contrast_limit: 0.15
+          p: 0.4
+        ColorJitter:
+          brightness: 0.15
+          contrast: 0.15
+          saturation: 0.15
+          hue: 0.05
+          p: 0.4
+        Affine:
+          scale: [0.9, 1.1]
+          translate_percent: [-0.05, 0.05]
+          rotate: [-5, 5]
+          p: 0.3

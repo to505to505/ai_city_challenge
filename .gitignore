@@ -1,1 +1,20 @@
+# Hafnia / project caches
 .data/
+trainer.zip
+weights/
+
+# Build artefacts
+state.json
+.monitor.py
+.monitor.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
