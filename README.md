@@ -112,7 +112,157 @@ Without `hafnia configure`, `HafniaDataset.from_name(...)` falls back to
 the local sample variant if one is cached; otherwise it errors with
 `No active profile configured`.
 
-## 5. Repo layout
+### CLI command surface
+
+Each group accepts `--help` to list its subcommands and options.
+
+```text
+hafnia configure                       Interactive first-time setup (profile name, API key, URL)
+hafnia clear                           Remove all stored configuration
+
+hafnia profile     ls | active | use | rm | create               Manage local profiles
+hafnia dataset     ls | download | delete                        Manage datasets on the platform
+hafnia recipe      ls | create | rm                              Manage dataset recipes on the platform
+hafnia trainer     ls | create | update | create-zip | view-zip  Manage trainer packages
+hafnia experiment  ls | create | environments                    Launch and inspect experiments
+hafnia runc        build | build-local | launch-local            Build and run trainer packages locally
+```
+
+## 5. Training on Hafnia: Trainer Packages
+
+### Training-as-a-Service (Training-aaS) concept
+
+Training-aaS lets you train models on **hidden datasets** — datasets that
+are usable for training but never available for direct download. Privacy
+and licensing are preserved by running *your code* against the data inside
+the platform, not the other way around.
+
+Two artifacts make this work:
+
+- **Sample dataset** — a small, anonymized subset of every hidden dataset,
+  downloadable locally (this is what `eccv-cross-city` gives you when you
+  pull it on your laptop). Use it for development, debugging, and
+  visualization.
+- **Trainer package** — a ZIP of your training project (code +
+  `Dockerfile` + training command) that the platform builds and runs
+  against the full dataset.
+
+The same `HafniaDataset.from_name("...")` call returns the sample dataset
+locally and the full dataset under Training-aaS, so the training script
+itself does not change between environments.
+
+### Option A — public trainer package (no code)
+
+For common tasks Hafnia ships ready-made trainers. To launch one:
+
+1. Sign in to the Hafnia platform and open the experiments dashboard.
+2. Click **Create Experiment**, pick your dataset (or data recipe).
+3. Under **Trainer package**, open the **Public Trainers** tab and select
+   one — e.g. *Object Detection Trainer* (wraps RF-DETR, compatible with
+   COCO-style datasets).
+4. Set the training command (e.g. `python scripts/train.py`) and the
+   configuration tier (`Lite`, `Pro`, `Scale`).
+5. **Create Experiment** and monitor progress in the dashboard.
+
+The default Object Detection trainer converges in ~4 hours on
+`midwest-vehicle-detection` at the `Lite` tier.
+
+### Option B — bring your own trainer package
+
+When you need a different model, custom loop, or your own metrics,
+package your project as a trainer ZIP and launch it like a public one.
+
+Reference templates (read these — they document structure, expected
+entry points, and `HafniaLogger` integration):
+
+- [`trainer-classification`](https://github.com/milestone-hafnia/trainer-classification) — image classification.
+- [`trainer-object-detection`](https://github.com/milestone-hafnia/trainer-object-detection) — RF-DETR wrapper for detection (a sensible starting point for this challenge).
+
+CLI workflow:
+
+```bash
+# Build trainer.zip from the current project
+hafnia trainer create-zip .
+
+# One-shot: package + upload + launch
+hafnia trainer create .                                # upload only
+hafnia experiment create \
+    --dataset eccv-cross-city \
+    --trainer-path . \
+    --cmd "python scripts/train.py --epochs 50"        # package + upload + launch
+
+# Manage existing trainers
+hafnia trainer ls                                       # your trainers
+hafnia trainer ls --visibility public                   # public trainers
+hafnia trainer update <trainer-id> .                    # push a new version
+hafnia trainer view-zip trainer.zip                     # inspect ZIP contents
+
+# Launch against an already-uploaded trainer
+hafnia experiment create --dataset eccv-cross-city --trainer-id <trainer-id>
+```
+
+Trainer packages are visible to your whole organization — saved trainers
+can be reused by teammates.
+
+### Test the build locally (Docker)
+
+Before uploading, build the trainer in the same way the platform does
+and run it against a sample dataset:
+
+```bash
+# Build the docker image from trainer.zip
+hafnia runc build-local trainer.zip
+
+# Run that image locally against a sample dataset
+hafnia runc launch-local --dataset eccv-cross-city "python scripts/train.py"
+```
+
+This catches syntax errors, missing dependencies, and `Dockerfile`
+problems before they fail in the cloud. (VS Code's *Model Training*
+debug configuration is also wired up for this.)
+
+### Experiment tracking with `HafniaLogger`
+
+`HafniaLogger` collects the model artifact, checkpoints, hyperparameters,
+and training/eval metrics. Locally it writes to
+`.data/experiments/{DATE_TIME}/`; under Training-aaS the same data is
+streamed into the platform's experiments view.
+
+```python
+from hafnia.experiment import HafniaLogger
+
+logger = HafniaLogger(project_name="eccv-cross-city-detector")
+logger.log_configuration({"batch_size": 16, "lr": 1e-4, "model": "RFDETRNano"})
+
+ckpt_dir  = logger.path_model_checkpoints()  # save intermediate checkpoints here
+model_dir = logger.path_model()              # save the final model here
+
+logger.log_scalar("train/loss", value=0.42, step=100)
+logger.log_metric("validation/mAP", value=0.31, step=100)
+```
+
+### Composing data with `DatasetRecipe`
+
+A recipe is a serializable spec of "load this dataset, then do these
+operations" (shuffle, select, merge, filter, drop classes, split). It
+runs locally and uploads to the platform unchanged, so the same training
+data definition is used everywhere.
+
+```python
+from hafnia.dataset.dataset_recipe.dataset_recipe import DatasetRecipe
+
+recipe = (
+    DatasetRecipe.from_name("eccv-cross-city", version="1.0.0")
+        .shuffle()
+        .select_samples(n_samples=200)
+)
+dataset = recipe.build()
+recipe.as_platform_recipe(recipe_name="eccv-200-sample", overwrite=True)
+```
+
+`hafnia recipe ls | create | rm` manages recipes on the platform.
+
+## 6. Repo layout
 
 ```
 .
@@ -129,7 +279,7 @@ the local sample variant if one is cached; otherwise it errors with
 (hardcoded for the original author's environment) — if you re-run it
 locally, fix those paths first.
 
-## 6. Working notes / gotchas
+## 7. Working notes / gotchas
 
 - **Bboxes are normalized.** Multiply by image `W`, `H` before drawing or
   feeding into detectors that expect absolute coordinates.
@@ -144,10 +294,15 @@ locally, fix those paths first.
 - **Don't push raw imagery anywhere.** The licensing is privacy-bounded;
   the Hafnia TaaS flow is the supported way to train at scale.
 
-## 7. References
+## 8. References
 
 - AI City Challenge home: https://www.aicitychallenge.org/
 - Hafnia platform: https://hafnia.milestonesys.com/
 - Hafnia docs: https://hafnia.readme.io/docs/welcome-to-hafnia
+- API-key guide: https://hafnia.readme.io/docs/create-an-api-key
 - Hafnia on PyPI: https://pypi.org/project/hafnia/
+- Hafnia SDK/CLI source: https://github.com/milestone-hafnia/hafnia
+- Reference trainer — classification: https://github.com/milestone-hafnia/trainer-classification
+- Reference trainer — object detection: https://github.com/milestone-hafnia/trainer-object-detection
+- Data library: https://hafnia.milestonesys.com/training-aas/datasets
 - ECCV 2026: https://eccv.ecva.net/
