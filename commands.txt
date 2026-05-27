@@ -28,6 +28,33 @@ hafnia trainer ls --visibility public
 hafnia experiment create --dataset eccv-cross-city --trainer-id <trainer-id>
 
 
+# === Выбор GPU / окружения ===
+# Доступные окружения (в твоём аккаунте):
+#   Lite   — 1 × NVIDIA T4 (16 GB VRAM),  4 CPU,  $0.82/h,  83 credits/h
+#   Scale  — 4 × NVIDIA T4 (64 GB VRAM),  48 CPU, $5.45/h, 546 credits/h
+# Тип GPU фиксирован (только T4). Scale = 4 карты, не более мощная — код должен уметь multi-GPU (DDP/accelerate).
+
+# Посмотреть актуальный список окружений
+hafnia experiment environments
+
+# 1 × T4 — дешёво, для отладки
+hafnia experiment create \
+    -d eccv-cross-city \
+    -p . \
+    -e Lite \
+    -c "python scripts/train.py --epochs 5"
+
+# 4 × T4 — полноценная тренировка
+hafnia experiment create \
+    -d eccv-cross-city \
+    -p . \
+    -e Scale \
+    -c "python scripts/train.py --epochs 50"
+
+
+
+
+
 # === Локальная проверка перед заливкой ===
 
 # Собрать docker-образ как на платформе
