@@ -17,6 +17,7 @@ Run on Hafnia (one of these, see commands.txt):
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
 
@@ -107,13 +108,57 @@ def export_hafnia_to_coco(dataset_name: str, version: str, out_dir: Path) -> Pat
     return out_dir
 
 
+def publish_metrics_to_hafnia(hafnia_logger: HafniaLogger, output_dir: Path) -> None:
+    """Replay RF-DETR's metrics.csv into HafniaLogger.
+
+    Lightning's CSVLogger writes one row per logging event with columns like
+    `train/loss`, `val/map`, `val/per_class/Vehicle.Car/AP`, plus `step` and `epoch`.
+    We forward every numeric cell to HafniaLogger so the platform's MLflow run gets
+    populated with the same series — no duplicate run, no live forwarding.
+    """
+    import csv
+
+    csv_path = output_dir / "metrics.csv"
+    if not csv_path.exists():
+        print(f"[metrics] no metrics.csv at {csv_path} — nothing to publish")
+        return
+    published = 0
+    rows = 0
+    with csv_path.open() as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            rows += 1
+            try:
+                step = int(float(row.get("step") or row.get("epoch") or 0))
+            except (TypeError, ValueError):
+                step = 0
+            for key, cell in row.items():
+                if key in ("step", "epoch") or cell in (None, ""):
+                    continue
+                try:
+                    value = float(cell)
+                except (TypeError, ValueError):
+                    continue
+                # log_metric is for "evaluation" metrics; log_scalar for everything else.
+                # Both end up in the platform's UI, the distinction is just label-grouping.
+                fn = hafnia_logger.log_metric if "/" in key and key.split("/", 1)[0] in {"val", "validation", "test"} else hafnia_logger.log_scalar
+                try:
+                    fn(name=key, value=value, step=step)
+                    published += 1
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[metrics] skipped {key}={value} step={step}: {exc!r}")
+                    break
+    print(f"[metrics] published {published} datapoints from {rows} rows of {csv_path}")
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--epochs", type=int, default=50)
-    # Tuned for a single T4 (16 GB VRAM): bs=1 × accum=16 = effective batch 16.
-    # On Scale (4 × T4) bump --batch-size to 2 and drop --grad-accum-steps to 4.
-    p.add_argument("--batch-size", type=int, default=1)
-    p.add_argument("--grad-accum-steps", type=int, default=16, help="effective batch = batch_size * grad_accum_steps * devices")
+    # Tuned for a single T4 (16 GB VRAM): bs=8, no grad accumulation.
+    # VRAM @ bs=8 / 704 / fp32: ~12-13 GB peak (probe + real-train overhead).
+    # If you see OOM on the platform, drop to --batch-size 4 --grad-accum-steps 2 (same effective batch).
+    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--grad-accum-steps", type=int, default=1, help="effective batch = batch_size * grad_accum_steps * devices")
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--lr-encoder", type=float, default=1.5e-4)
     p.add_argument("--num-workers", type=int, default=2)
@@ -170,6 +215,10 @@ def main() -> None:
 
     model = RFDETRLarge(num_classes=NUM_CLASSES, resolution=args.resolution, **pretrain_kwargs)
 
+    # We intentionally do NOT pass `mlflow=True` to RF-DETR. RF-DETR would spin up its own PTL
+    # MLflowLogger and create a SECOND mlflow run alongside the one HafniaLogger already started
+    # (the platform's UI then shows two sibling runs in the experiment). Instead, we let RF-DETR's
+    # CSVLogger write `metrics.csv` to output_dir and replay it into HafniaLogger after training.
     model.train(
         dataset_dir=str(coco_dir),
         dataset_file="roboflow",
@@ -195,7 +244,26 @@ def main() -> None:
         run=args.run_name,
     )
 
-    print(f"[done] checkpoints in {logger.path_model_checkpoints()}")
+    # Replay PTL CSVLogger metrics into HafniaLogger so they land in the platform's MLflow run.
+    publish_metrics_to_hafnia(logger, Path(logger.path_model_checkpoints()))
+
+    # Copy the best checkpoint into HafniaLogger's model dir so the platform surfaces it as the
+    # "Trained model" artifact (the Hafnia dashboard reads /opt/ml/model, not /opt/ml/checkpoints).
+    ckpt_dir = Path(logger.path_model_checkpoints())
+    model_dir = Path(logger.path_model())
+    model_dir.mkdir(parents=True, exist_ok=True)
+    saved = []
+    for name in ("checkpoint_best_total.pth", "checkpoint_best_ema.pth", "checkpoint_best_regular.pth"):
+        src = ckpt_dir / name
+        if src.exists():
+            dst = model_dir / name
+            shutil.copy2(src, dst)
+            saved.append(dst.name)
+    if saved:
+        print(f"[done] published model checkpoints to {model_dir}: {saved}")
+    else:
+        print(f"[warn] no best-checkpoint files found in {ckpt_dir}; nothing copied to model dir")
+    print(f"[done] all checkpoints in {ckpt_dir}")
 
 
 if __name__ == "__main__":

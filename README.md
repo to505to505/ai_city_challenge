@@ -300,7 +300,7 @@ This repository is laid out as a **Hafnia trainer package** that fine-tunes
 | `num_windows`       | 2     | architectural — do not change                              |
 | `pretrain_weights`  | `rf-detr-large-2026.pth` | downloaded on first run by RF-DETR |
 | `dataset_file`      | `roboflow` | matches the layout `to_coco_format` writes             |
-| `batch_size × grad_accum` | 1 × 16 = 16 | effective per-device batch — safe for one T4 (16 GB)  |
+| `batch_size × grad_accum` | 8 × 1 = 8 | empirically measured ~12-13 GB on T4 (probe + real-train) — fits with ~3 GB headroom |
 | `multi_scale` / `expanded_scales` | `false` | off for Lite (would push activations past 704 on T4); flip to `true` on Scale |
 
 ### Logging

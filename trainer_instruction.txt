@@ -339,7 +339,12 @@ CLI команды НЕТ. Варианты:
 
 [4] OOM на T4 16 GB при RF-DETR Large 704x704
     Симптом: контейнер падает в начале первой эпохи.
-    Фикс: batch_size=1, grad_accum_steps=16, multi_scale=False.
+    Реальный расход (измерено probe + real-train на 3060):
+      bs=1  → ~3 GB    bs=4  → ~8 GB
+      bs=2  → ~5 GB    bs=8  → ~13 GB   ← наш дефолт, ~3 GB запас на T4
+      bs=16 → ~22 GB OOM
+    Если на платформе всё-таки OOM: --batch-size 4 --grad-accum-steps 2
+    (или 1×8 — медленнее но точно влезет). multi_scale=False обязательно.
 
 [5] Ключи в --cmd
     Любой WANDB_API_KEY / прочий секрет в --cmd попадает в метадату навсегда.
