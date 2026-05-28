@@ -17,9 +17,12 @@ Run on Hafnia (one of these, see commands.txt):
 from __future__ import annotations
 
 import argparse
+import csv
 import shutil
 import sys
+import threading
 from pathlib import Path
+from typing import Dict
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 # rf-detr lives in the repo as a plain folder (not pip-installed) so we expose its source.
@@ -108,47 +111,135 @@ def export_hafnia_to_coco(dataset_name: str, version: str, out_dir: Path) -> Pat
     return out_dir
 
 
-def publish_metrics_to_hafnia(hafnia_logger: HafniaLogger, output_dir: Path) -> None:
-    """Replay RF-DETR's metrics.csv into HafniaLogger.
+BEST_CKPT_FILES = (
+    "checkpoint_best_total.pth",
+    "checkpoint_best_ema.pth",
+    "checkpoint_best_regular.pth",
+)
 
-    Lightning's CSVLogger writes one row per logging event with columns like
-    `train/loss`, `val/map`, `val/per_class/Vehicle.Car/AP`, plus `step` and `epoch`.
-    We forward every numeric cell to HafniaLogger so the platform's MLflow run gets
-    populated with the same series — no duplicate run, no live forwarding.
+
+def _publish_row(hafnia_logger: HafniaLogger, row: dict, step: int) -> int:
+    """Push every numeric cell in one CSV row to HafniaLogger. Returns count pushed."""
+    n = 0
+    for key, cell in row.items():
+        if key in ("step", "epoch") or cell in (None, ""):
+            continue
+        try:
+            value = float(cell)
+        except (TypeError, ValueError):
+            continue
+        # log_metric for evaluation series, log_scalar for everything else — both end
+        # up in the platform UI, the split is just label-grouping.
+        is_eval = "/" in key and key.split("/", 1)[0] in {"val", "validation", "test"}
+        fn = hafnia_logger.log_metric if is_eval else hafnia_logger.log_scalar
+        try:
+            fn(name=key, value=value, step=step)
+            n += 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"[metrics] skipped {key}={value} step={step}: {exc!r}")
+    return n
+
+
+class TrainStreamingWatcher:
+    """Background thread that tails RF-DETR outputs into HafniaLogger LIVE.
+
+    `model.train()` blocks for hours. Without live publishing the platform dashboard
+    stays empty until training finishes, and if training crashes mid-run nothing
+    survives. So we run this watcher in parallel:
+
+      * tails `<output_dir>/metrics.csv` and forwards new rows via log_scalar/log_metric
+      * copies `checkpoint_best_*.pth` from `output_dir` to `path_model()` whenever
+        their mtime advances — so the platform's "Trained model" artifact updates
+        as soon as a new best epoch lands, even if training is later killed
+
+    Both operations are idempotent (cursor for CSV rows; mtime check for ckpts) so
+    a final flush after `train()` returns is safe and recommended.
     """
-    import csv
 
-    csv_path = output_dir / "metrics.csv"
-    if not csv_path.exists():
-        print(f"[metrics] no metrics.csv at {csv_path} — nothing to publish")
-        return
-    published = 0
-    rows = 0
-    with csv_path.open() as fh:
-        reader = csv.DictReader(fh)
-        for row in reader:
-            rows += 1
+    def __init__(
+        self,
+        hafnia_logger: HafniaLogger,
+        ckpt_dir: Path,
+        model_dir: Path,
+        interval_seconds: float = 30.0,
+    ) -> None:
+        self.logger = hafnia_logger
+        self.ckpt_dir = ckpt_dir
+        self.model_dir = model_dir
+        self.interval = interval_seconds
+        self.csv_path = ckpt_dir / "metrics.csv"
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._rows_published = 0
+        self._ckpt_mtime: Dict[str, float] = {}
+
+    def _tick(self) -> None:
+        # 1. metrics.csv → HafniaLogger
+        if self.csv_path.exists():
             try:
-                step = int(float(row.get("step") or row.get("epoch") or 0))
-            except (TypeError, ValueError):
-                step = 0
-            for key, cell in row.items():
-                if key in ("step", "epoch") or cell in (None, ""):
-                    continue
+                with self.csv_path.open() as fh:
+                    rows = list(csv.DictReader(fh))
+            except Exception as exc:  # noqa: BLE001
+                print(f"[watcher] csv read error: {exc!r}")
+                rows = []
+            new = rows[self._rows_published :]
+            pushed = 0
+            for row in new:
                 try:
-                    value = float(cell)
+                    step = int(float(row.get("step") or row.get("epoch") or 0))
                 except (TypeError, ValueError):
-                    continue
-                # log_metric is for "evaluation" metrics; log_scalar for everything else.
-                # Both end up in the platform's UI, the distinction is just label-grouping.
-                fn = hafnia_logger.log_metric if "/" in key and key.split("/", 1)[0] in {"val", "validation", "test"} else hafnia_logger.log_scalar
+                    step = 0
+                pushed += _publish_row(self.logger, row, step)
+            if new:
+                self._rows_published = len(rows)
+                print(f"[watcher] +{pushed} metrics from {len(new)} new rows (total {self._rows_published} rows)")
+
+        # 2. checkpoint_best_*.pth → path_model()
+        for name in BEST_CKPT_FILES:
+            src = self.ckpt_dir / name
+            if not src.exists():
+                continue
+            mtime = src.stat().st_mtime
+            if self._ckpt_mtime.get(name, 0.0) >= mtime:
+                continue
+            try:
+                shutil.copy2(src, self.model_dir / name)
+                self._ckpt_mtime[name] = mtime
+                print(f"[watcher] published {name} → {self.model_dir}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[watcher] copy {name} error: {exc!r}")
+
+    def _run(self) -> None:
+        # Tick once immediately so very-early metrics appear without an `interval` delay,
+        # then enter the periodic loop. A final tick runs in stop() to flush anything
+        # written between the last interval and end-of-training.
+        try:
+            self._tick()
+            while not self._stop.wait(self.interval):
                 try:
-                    fn(name=key, value=value, step=step)
-                    published += 1
+                    self._tick()
                 except Exception as exc:  # noqa: BLE001
-                    print(f"[metrics] skipped {key}={value} step={step}: {exc!r}")
-                    break
-    print(f"[metrics] published {published} datapoints from {rows} rows of {csv_path}")
+                    print(f"[watcher] tick error: {exc!r}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[watcher] thread crashed: {exc!r}")
+
+    def start(self) -> "TrainStreamingWatcher":
+        self.model_dir.mkdir(parents=True, exist_ok=True)
+        self._thread = threading.Thread(target=self._run, name="hafnia-stream", daemon=True)
+        self._thread.start()
+        print(f"[watcher] started (interval={self.interval}s) — tailing {self.csv_path}")
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=60)
+        # One final synchronous flush so partial writes from the last interval land.
+        try:
+            self._tick()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[watcher] final flush error: {exc!r}")
+        print(f"[watcher] stopped — total rows published: {self._rows_published}, ckpts mirrored: {sorted(self._ckpt_mtime)}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -176,6 +267,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wandb", action="store_true", help="local only — W&B is blocked in Hafnia cloud")
     p.add_argument("--wandb-project", default="eccv-cross-city")
     p.add_argument("--run-name", default=None, help="W&B run name (also used as the experiment name)")
+    p.add_argument(
+        "--stream-interval",
+        type=float,
+        default=30.0,
+        help="seconds between watcher ticks that tail metrics.csv → HafniaLogger and mirror best ckpts to path_model()",
+    )
     return p.parse_args()
 
 
@@ -215,55 +312,53 @@ def main() -> None:
 
     model = RFDETRLarge(num_classes=NUM_CLASSES, resolution=args.resolution, **pretrain_kwargs)
 
-    # We intentionally do NOT pass `mlflow=True` to RF-DETR. RF-DETR would spin up its own PTL
-    # MLflowLogger and create a SECOND mlflow run alongside the one HafniaLogger already started
-    # (the platform's UI then shows two sibling runs in the experiment). Instead, we let RF-DETR's
-    # CSVLogger write `metrics.csv` to output_dir and replay it into HafniaLogger after training.
-    model.train(
-        dataset_dir=str(coco_dir),
-        dataset_file="roboflow",
-        output_dir=str(logger.path_model_checkpoints()),
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        grad_accum_steps=args.grad_accum_steps,
-        lr=args.lr,
-        lr_encoder=args.lr_encoder,
-        num_workers=args.num_workers,
-        devices=args.devices,
-        class_names=CLASS_NAMES,
-        aug_config=AUG_CONFIG,
-        # multi_scale + expanded_scales make per-batch resolution vary up to 768 — too risky
-        # on a single 16 GB T4 at base resolution 704. Disable both for Lite; flip to True on Scale.
-        multi_scale=False,
-        expanded_scales=False,
-        square_resize_div_64=True,
-        use_ema=True,
-        tensorboard=True,
-        wandb=args.wandb,
-        project=args.wandb_project,
-        run=args.run_name,
-    )
-
-    # Replay PTL CSVLogger metrics into HafniaLogger so they land in the platform's MLflow run.
-    publish_metrics_to_hafnia(logger, Path(logger.path_model_checkpoints()))
-
-    # Copy the best checkpoint into HafniaLogger's model dir so the platform surfaces it as the
-    # "Trained model" artifact (the Hafnia dashboard reads /opt/ml/model, not /opt/ml/checkpoints).
+    # Resolve once so the watcher and model.train() share the exact same directories.
     ckpt_dir = Path(logger.path_model_checkpoints())
     model_dir = Path(logger.path_model())
-    model_dir.mkdir(parents=True, exist_ok=True)
-    saved = []
-    for name in ("checkpoint_best_total.pth", "checkpoint_best_ema.pth", "checkpoint_best_regular.pth"):
-        src = ckpt_dir / name
-        if src.exists():
-            dst = model_dir / name
-            shutil.copy2(src, dst)
-            saved.append(dst.name)
-    if saved:
-        print(f"[done] published model checkpoints to {model_dir}: {saved}")
-    else:
-        print(f"[warn] no best-checkpoint files found in {ckpt_dir}; nothing copied to model dir")
-    print(f"[done] all checkpoints in {ckpt_dir}")
+
+    # We intentionally do NOT pass `mlflow=True` to RF-DETR. RF-DETR would spin up its own PTL
+    # MLflowLogger and create a SECOND mlflow run alongside the one HafniaLogger already started.
+    # Instead, the watcher tails RF-DETR's metrics.csv into HafniaLogger LIVE during training,
+    # and a final flush in `finally` catches anything written after the last interval tick.
+    watcher = TrainStreamingWatcher(
+        hafnia_logger=logger,
+        ckpt_dir=ckpt_dir,
+        model_dir=model_dir,
+        interval_seconds=args.stream_interval,
+    ).start()
+
+    try:
+        model.train(
+            dataset_dir=str(coco_dir),
+            dataset_file="roboflow",
+            output_dir=str(ckpt_dir),
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            grad_accum_steps=args.grad_accum_steps,
+            lr=args.lr,
+            lr_encoder=args.lr_encoder,
+            num_workers=args.num_workers,
+            devices=args.devices,
+            class_names=CLASS_NAMES,
+            aug_config=AUG_CONFIG,
+            # multi_scale + expanded_scales make per-batch resolution vary up to 768 — too risky
+            # on a single 16 GB T4 at base resolution 704. Disable both for Lite; flip to True on Scale.
+            multi_scale=False,
+            expanded_scales=False,
+            square_resize_div_64=True,
+            use_ema=True,
+            tensorboard=True,
+            wandb=args.wandb,
+            project=args.wandb_project,
+            run=args.run_name,
+        )
+    finally:
+        # Stop the watcher whether train() succeeded, raised, or got SIGTERM'd.
+        # `stop()` also runs one last tick so partial writes between the final interval
+        # and end-of-training still make it into HafniaLogger / path_model().
+        watcher.stop()
+
+    print(f"[done] checkpoints in {ckpt_dir}; trained model in {model_dir}")
 
 
 if __name__ == "__main__":

@@ -35,3 +35,9 @@ rf-detr/tests/
 rf-detr/CHANGELOG.md
 rf-detr/CITATION.cff
 rf-detr/mkdocs.yaml
+
+# BDD100K Cascade-R-CNN checkpoint — kept locally for reference / future experiments
+# but NOT used by the current RF-DETR Large trainer, so we exclude it from trainer.zip
+# (saves ~834 MB of upload).
+weights/cascade_rcnn_convnext-s_fpn_fp16_3x_det_bdd100k.pth
+weights/PROVENANCE.md
