@@ -86,6 +86,23 @@ AUG_CONFIG = {
     },
 }
 
+# Phase-2 domain-generalization preset: stronger PHOTOMETRIC + sensor-noise variation to
+# simulate a DIFFERENT camera / lighting (the hidden target city), pushing the model toward
+# shape/structure cues over source-city appearance. Geometry stays mild (cameras are fixed,
+# mounted) — no vertical flip / big rotations. Only transforms that appear in RF-DETR's own
+# presets are used, so the param names are proven and it works under BOTH the Albumentations
+# (default) and Kornia/GPU backends (no risk of an unsupported-key ValueError).
+AUG_DG = {
+    "HorizontalFlip": {"p": 0.5},
+    "RandomBrightnessContrast": {"brightness_limit": 0.4, "contrast_limit": 0.4, "p": 0.7},
+    "ColorJitter": {"brightness": 0.3, "contrast": 0.3, "saturation": 0.4, "hue": 0.1, "p": 0.6},
+    "GaussNoise": {"std_range": (0.01, 0.08), "p": 0.4},
+    "GaussianBlur": {"blur_limit": 3, "p": 0.25},
+    "Affine": {"scale": (0.9, 1.1), "translate_percent": (-0.05, 0.05), "rotate": (-5, 5), "p": 0.3},
+}
+
+AUG_PRESETS = {"baseline": AUG_CONFIG, "dg": AUG_DG}
+
 
 def load_hafnia_dataset(dataset_name: str, version: str) -> HafniaDataset:
     """Load HafniaDataset.
@@ -375,6 +392,27 @@ def parse_args() -> argparse.Namespace:
              "a DG-honest proxy for the hidden target city). 0 = use the native splits.",
     )
     p.add_argument("--split-seed", type=int, default=42, help="seed for which cameras are held out")
+    p.add_argument(
+        "--aug-preset",
+        choices=["baseline", "dg"],
+        default="baseline",
+        help="baseline = mild reference augs; dg = stronger photometric+noise for domain "
+             "generalization (Phase 2). See AUG_DG.",
+    )
+    p.add_argument(
+        "--init-weights",
+        default=None,
+        help="Warm-start checkpoint to fine-tune FROM (path, relative to repo root or absolute), "
+             "e.g. weights/v5_best_ema.pth. Overrides the bundled COCO-pretrained weights. Must be "
+             "bundled under weights/ so it ships inside trainer.zip (cloud has no network).",
+    )
+    p.add_argument(
+        "--lr-scheduler",
+        choices=["step", "cosine"],
+        default="step",
+        help="step = RF-DETR default (lr_drop); cosine = decay toward ~0 over --epochs "
+             "(better for short fine-tunes off a converged checkpoint).",
+    )
     # NOTE: Hafnia Training-aaS containers are network-isolated — wandb.ai is unreachable.
     # Keep --wandb only for local runs. HafniaLogger writes via the platform's VPC MLflow.
     p.add_argument("--wandb", action="store_true", help="local only — W&B is blocked in Hafnia cloud")
@@ -391,6 +429,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    aug = AUG_PRESETS[args.aug_preset]
 
     logger = HafniaLogger(project_name="eccv-cross-city-rfdetr-large")
     logger.log_configuration(
@@ -405,10 +444,13 @@ def main() -> None:
             "grad_accum_steps": args.grad_accum_steps,
             "lr": args.lr,
             "lr_encoder": args.lr_encoder,
+            "lr_scheduler": args.lr_scheduler,
             "devices": args.devices,
             "val_camera_frac": args.val_camera_frac,
             "split_seed": args.split_seed,
-            "augmentations": AUG_CONFIG,
+            "aug_preset": args.aug_preset,
+            "init_weights": args.init_weights,
+            "augmentations": aug,
         }
     )
 
@@ -422,15 +464,26 @@ def main() -> None:
         val_camera_frac=args.val_camera_frac, split_seed=args.split_seed,
     )
 
+    # Pick the init checkpoint: --init-weights (warm-start / fine-tune FROM a prior run) wins;
+    # otherwise the bundled COCO-pretrained RF-DETR Large. A warm-start ckpt already has the
+    # 10-class head, so it loads cleanly (no head re-init), unlike the 90-class COCO weights.
+    if args.init_weights:
+        init_path = Path(args.init_weights)
+        if not init_path.is_absolute():
+            init_path = REPO_ROOT / init_path
+    else:
+        init_path = _BUNDLED_PRETRAIN
+
     pretrain_kwargs = {}
-    if _BUNDLED_PRETRAIN.exists():
-        print(f"[model] using bundled pretrain weights {_BUNDLED_PRETRAIN}")
-        pretrain_kwargs["pretrain_weights"] = str(_BUNDLED_PRETRAIN)
+    if init_path.exists():
+        print(f"[model] init weights: {init_path}"
+              + (" (warm-start / fine-tune)" if args.init_weights else " (bundled COCO-pretrain)"))
+        pretrain_kwargs["pretrain_weights"] = str(init_path)
     elif is_hafnia_cloud_job():
         raise FileNotFoundError(
-            f"Pretrain weights not bundled at {_BUNDLED_PRETRAIN}. Hafnia cloud blocks "
-            "outbound network, so RF-DETR cannot download them at runtime. Place "
-            "rf-detr-large-2026.pth in ./weights/ and rebuild the trainer."
+            f"Init weights not found at {init_path}. Hafnia cloud blocks outbound network, so "
+            "RF-DETR cannot download them at runtime. Bundle the checkpoint under ./weights/ and "
+            "rebuild the trainer (see scripts/download_weights.py for the base weights)."
         )
 
     model = RFDETRLarge(num_classes=NUM_CLASSES, resolution=args.resolution, **pretrain_kwargs)
@@ -471,8 +524,9 @@ def main() -> None:
             num_workers=args.num_workers,
             devices=args.devices,
             strategy=strategy,
+            lr_scheduler=args.lr_scheduler,
             class_names=CLASS_NAMES,
-            aug_config=AUG_CONFIG,
+            aug_config=aug,
             # multi_scale + expanded_scales make per-batch resolution vary up to 768 — too risky
             # on a single 16 GB T4 at base resolution 704. Disable both for Lite; flip to True on Scale.
             multi_scale=False,
