@@ -307,6 +307,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr-encoder", type=float, default=1.5e-4)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--devices", type=int, default=1, help="1 for Lite (1 × T4), 4 for Scale (4 × T4)")
+    p.add_argument(
+        "--strategy",
+        default=None,
+        help="PTL strategy. Default: 'ddp' when --devices>1, else 'auto'. RF-DETR Large "
+             "(detection) leaves some params unused per step, so multi-GPU DDP needs "
+             "find_unused_parameters=True — our patched trainer enables that for strategy='ddp'.",
+    )
     p.add_argument("--resolution", type=int, default=RESOLUTION, help="must be divisible by 32 for RF-DETR Large")
     p.add_argument("--dataset-name", default="eccv-cross-city")
     p.add_argument("--dataset-version", default="1.0.0")
@@ -398,6 +405,13 @@ def main() -> None:
         interval_seconds=args.stream_interval,
     ).start()
 
+    # Multi-GPU (Scale) uses DDP. RF-DETR Large detection leaves some parameters unused
+    # on a given step, which plain DDP rejects ("parameters that were not used in producing
+    # the loss"). We pass strategy="ddp" so the patched trainer builds
+    # DDPStrategy(find_unused_parameters=True). Single-GPU stays on "auto" (no DDP).
+    strategy = args.strategy or ("ddp" if args.devices > 1 else "auto")
+    print(f"[train] devices={args.devices} strategy={strategy!r}")
+
     try:
         model.train(
             dataset_dir=str(coco_dir),
@@ -410,6 +424,7 @@ def main() -> None:
             lr_encoder=args.lr_encoder,
             num_workers=args.num_workers,
             devices=args.devices,
+            strategy=strategy,
             class_names=CLASS_NAMES,
             aug_config=AUG_CONFIG,
             # multi_scale + expanded_scales make per-batch resolution vary up to 768 — too risky
