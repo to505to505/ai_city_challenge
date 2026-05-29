@@ -24,7 +24,7 @@ import sys
 import threading
 from collections import Counter
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import polars as pl
 
@@ -171,26 +171,24 @@ BEST_CKPT_FILES = (
 )
 
 
-def _publish_row(hafnia_logger: HafniaLogger, row: dict, step: int) -> int:
-    """Push every numeric cell in one CSV row to HafniaLogger. Returns count pushed."""
-    n = 0
-    for key, cell in row.items():
-        if key in ("step", "epoch") or cell in (None, ""):
-            continue
-        try:
-            value = float(cell)
-        except (TypeError, ValueError):
-            continue
-        # log_metric for evaluation series, log_scalar for everything else — both end
-        # up in the platform UI, the split is just label-grouping.
-        is_eval = "/" in key and key.split("/", 1)[0] in {"val", "validation", "test"}
-        fn = hafnia_logger.log_metric if is_eval else hafnia_logger.log_scalar
-        try:
-            fn(name=key, value=value, step=step)
-            n += 1
-        except Exception as exc:  # noqa: BLE001
-            print(f"[metrics] skipped {key}={value} step={step}: {exc!r}")
-    return n
+def _capture_mlflow_run_id() -> Optional[str]:
+    """Return the run_id of the MLflow run HafniaLogger started, or None.
+
+    MUST be called from the MAIN thread (where HafniaLogger called mlflow.start_run()).
+    MLflow keeps the active-run stack per-thread, so a background thread calling
+    HafniaLogger.log_scalar (→ fluent mlflow.log_metric) would NOT see this run and would
+    spawn a fresh auto-named "orphan" run. The watcher re-binds this run_id inside its own
+    thread (mlflow.start_run(run_id=...)) so the documented logger.log_scalar/log_metric API
+    lands in the correct run.
+    """
+    try:
+        import mlflow
+
+        active = mlflow.active_run()
+        return active.info.run_id if active is not None else None
+    except Exception as exc:  # noqa: BLE001
+        print(f"[metrics] mlflow run capture failed ({exc!r}); local fallback")
+        return None
 
 
 class TrainStreamingWatcher:
@@ -225,9 +223,38 @@ class TrainStreamingWatcher:
         self._thread: threading.Thread | None = None
         self._rows_published = 0
         self._ckpt_mtime: Dict[str, float] = {}
+        # Capture the platform's MLflow run_id in the MAIN thread. The watcher re-binds it inside
+        # its own thread so the documented logger.log_scalar/log_metric API targets this run
+        # (and not an auto-created orphan run). None locally / when mlflow is absent.
+        self._mlflow_run_id = _capture_mlflow_run_id()
+
+    def _publish_row(self, row: dict, step: int) -> int:
+        """Push every numeric cell in one CSV row via the documented HafniaLogger API.
+
+        Uses ONLY logger.log_metric (evaluation series) / logger.log_scalar (everything else),
+        exactly as the Hafnia docs and the reference trainer-classification prescribe. The
+        watcher thread has already re-bound the platform's MLflow run (see _run), so these calls
+        land in the official run rather than an orphan one. Returns the count pushed.
+        """
+        n = 0
+        for key, cell in row.items():
+            if key in ("step", "epoch") or cell in (None, ""):
+                continue
+            try:
+                value = float(cell)
+            except (TypeError, ValueError):
+                continue
+            is_eval = "/" in key and key.split("/", 1)[0] in {"val", "validation", "test"}
+            fn = self.logger.log_metric if is_eval else self.logger.log_scalar
+            try:
+                fn(name=key, value=value, step=step)
+                n += 1
+            except Exception as exc:  # noqa: BLE001
+                print(f"[metrics] skipped {key}={value} step={step}: {exc!r}")
+        return n
 
     def _tick(self) -> None:
-        # 1. metrics.csv → HafniaLogger
+        # 1. metrics.csv → official run (stdout + MLflow)
         if self.csv_path.exists():
             try:
                 with self.csv_path.open() as fh:
@@ -242,7 +269,7 @@ class TrainStreamingWatcher:
                     step = int(float(row.get("step") or row.get("epoch") or 0))
                 except (TypeError, ValueError):
                     step = 0
-                pushed += _publish_row(self.logger, row, step)
+                pushed += self._publish_row(row, step)
             if new:
                 self._rows_published = len(rows)
                 print(f"[watcher] +{pushed} metrics from {len(new)} new rows (total {self._rows_published} rows)")
@@ -262,10 +289,28 @@ class TrainStreamingWatcher:
             except Exception as exc:  # noqa: BLE001
                 print(f"[watcher] copy {name} error: {exc!r}")
 
+    def _bind_mlflow_run_in_thread(self) -> None:
+        """Re-bind the platform's MLflow run to THIS thread's active-run stack.
+
+        After this, the documented logger.log_scalar/log_metric (→ fluent mlflow.log_metric)
+        resolves to the platform's run instead of spawning an orphan. We never end_run() here —
+        HafniaLogger.end_run() in the main thread owns the run lifecycle.
+        """
+        if self._mlflow_run_id is None:
+            return
+        try:
+            import mlflow
+
+            mlflow.start_run(run_id=self._mlflow_run_id)
+            print(f"[watcher] bound MLflow run {self._mlflow_run_id} in watcher thread")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[watcher] could not bind MLflow run in thread ({exc!r}); metrics may orphan")
+
     def _run(self) -> None:
-        # Tick once immediately so very-early metrics appear without an `interval` delay,
-        # then enter the periodic loop. A final tick runs in stop() to flush anything
-        # written between the last interval and end-of-training.
+        # Bind the official MLflow run to this thread FIRST so every log_scalar/log_metric
+        # lands in it. Then tick once immediately (early metrics appear without an interval
+        # delay) and enter the periodic loop. A final tick runs in stop() to flush the tail.
+        self._bind_mlflow_run_in_thread()
         try:
             self._tick()
             while not self._stop.wait(self.interval):
@@ -394,10 +439,11 @@ def main() -> None:
     ckpt_dir = Path(logger.path_model_checkpoints())
     model_dir = Path(logger.path_model())
 
-    # We intentionally do NOT pass `mlflow=True` to RF-DETR. RF-DETR would spin up its own PTL
-    # MLflowLogger and create a SECOND mlflow run alongside the one HafniaLogger already started.
-    # Instead, the watcher tails RF-DETR's metrics.csv into HafniaLogger LIVE during training,
-    # and a final flush in `finally` catches anything written after the last interval tick.
+    # We intentionally do NOT pass `mlflow=True` to RF-DETR — it would start a SECOND mlflow run
+    # next to the one HafniaLogger already owns. Instead the watcher tails RF-DETR's metrics.csv
+    # and forwards rows through the documented HafniaLogger.log_scalar/log_metric API LIVE during
+    # training (re-binding the run inside its thread so they land in the official run), with a
+    # final flush in `finally` for the tail.
     watcher = TrainStreamingWatcher(
         hafnia_logger=logger,
         ckpt_dir=ckpt_dir,
@@ -434,6 +480,12 @@ def main() -> None:
             square_resize_div_64=True,
             use_ema=True,
             tensorboard=True,
+            # RF-DETR defaults train_log_on_step=False → train metrics aggregate to ONE point
+            # per epoch, so charts look like a single dot on short runs. Turn it on so train
+            # metrics are logged per-step (CSVLogger flushes every log_every_n_steps=50) → a real
+            # curve. Validation stays one-point-per-epoch (you only validate once per epoch — that
+            # is inherent, not a bug).
+            train_log_on_step=True,
             wandb=args.wandb,
             project=args.wandb_project,
             run=args.run_name,

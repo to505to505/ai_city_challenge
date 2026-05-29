@@ -26,6 +26,10 @@ commands.txt
 trainer_instruction.txt
 .monitor.py
 .monitor.log
+.debug_out
+.debug_out2
+.debug_mlruns
+.vram_probe.py
 state.json
 
 # RF-DETR baggage we never need at training time
