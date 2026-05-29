@@ -18,11 +18,15 @@ from __future__ import annotations
 
 import argparse
 import csv
+import random
 import shutil
 import sys
 import threading
+from collections import Counter
 from pathlib import Path
 from typing import Dict
+
+import polars as pl
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 # rf-detr lives in the repo as a plain folder (not pip-installed) so we expose its source.
@@ -98,7 +102,52 @@ def load_hafnia_dataset(dataset_name: str, version: str) -> HafniaDataset:
     return HafniaDataset.from_name(dataset_name, version=version)
 
 
-def export_hafnia_to_coco(dataset_name: str, version: str, out_dir: Path) -> Path:
+def reassign_splits_by_camera(dataset: HafniaDataset, val_fraction: float, seed: int) -> HafniaDataset:
+    """Re-split the LABELED samples so whole cameras are held out for validation.
+
+    Why: the native split shares cameras between train and validation (verified:
+    every native-val camera also appears in train). That measures *same-camera*
+    generalization. The real test set is a HIDDEN second city, so a camera the
+    model never saw is a far better proxy. We hold out `val_fraction` of cameras
+    *entirely* — none of their frames appear in train — to get a DG-honest signal.
+
+    Only frames from the native train/validation splits (which carry ground truth)
+    are re-split; native `test` frames (GT withheld) are left untouched and unused.
+    """
+    df = dataset.samples
+    if "camera_info" not in df.columns:
+        print("[split] no camera_info column — keeping native splits")
+        return dataset
+
+    cam = df.select(pl.col("camera_info").struct.field("name")).to_series().to_list()
+    orig = df["split"].to_list()
+    labeled = {"train", "validation"}
+    cams_labeled = sorted({c for c, s in zip(cam, orig) if s in labeled and c is not None})
+    if not cams_labeled:
+        print("[split] no labeled cameras found — keeping native splits")
+        return dataset
+
+    n_val = max(1, round(len(cams_labeled) * val_fraction))
+    shuffled = list(cams_labeled)
+    random.Random(seed).shuffle(shuffled)
+    val_cams = set(shuffled[:n_val])
+
+    new_split = [
+        ("validation" if c in val_cams else "train") if s in labeled else s
+        for c, s in zip(cam, orig)
+    ]
+    out = dataset.update_samples(df.with_columns(pl.Series(new_split).alias("split")))
+
+    counts = Counter(new_split)
+    print(f"[split] leave-camera-out (seed={seed}): held out "
+          f"{n_val}/{len(cams_labeled)} cameras for validation")
+    print(f"[split] held-out cameras: {sorted(val_cams)}")
+    print(f"[split] new split counts: {dict(counts)}")
+    return out
+
+
+def export_hafnia_to_coco(dataset_name: str, version: str, out_dir: Path,
+                          val_camera_frac: float, split_seed: int) -> Path:
     """Export HafniaDataset to Roboflow-style COCO on disk, idempotent."""
     sentinel = out_dir / "train" / "_annotations.coco.json"
     if sentinel.exists():
@@ -106,6 +155,10 @@ def export_hafnia_to_coco(dataset_name: str, version: str, out_dir: Path) -> Pat
         return out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     dataset = load_hafnia_dataset(dataset_name, version)
+    if val_camera_frac and val_camera_frac > 0:
+        dataset = reassign_splits_by_camera(dataset, val_camera_frac, split_seed)
+    else:
+        print("[split] --val-camera-frac<=0 — using native dataset splits")
     print(f"[data] exporting to roboflow COCO layout at {out_dir}")
     dataset.to_coco_format(out_dir, coco_format_type="roboflow")
     return out_dir
@@ -262,6 +315,14 @@ def parse_args() -> argparse.Namespace:
         default=str(REPO_ROOT / ".data" / "coco" / "eccv-cross-city"),
         help="where to materialize the COCO copy of the dataset",
     )
+    p.add_argument(
+        "--val-camera-frac",
+        type=float,
+        default=0.2,
+        help="fraction of cameras held out ENTIRELY for validation (leave-camera-out, "
+             "a DG-honest proxy for the hidden target city). 0 = use the native splits.",
+    )
+    p.add_argument("--split-seed", type=int, default=42, help="seed for which cameras are held out")
     # NOTE: Hafnia Training-aaS containers are network-isolated — wandb.ai is unreachable.
     # Keep --wandb only for local runs. HafniaLogger writes via the platform's VPC MLflow.
     p.add_argument("--wandb", action="store_true", help="local only — W&B is blocked in Hafnia cloud")
@@ -293,11 +354,21 @@ def main() -> None:
             "lr": args.lr,
             "lr_encoder": args.lr_encoder,
             "devices": args.devices,
+            "val_camera_frac": args.val_camera_frac,
+            "split_seed": args.split_seed,
             "augmentations": AUG_CONFIG,
         }
     )
 
-    coco_dir = export_hafnia_to_coco(args.dataset_name, args.dataset_version, Path(args.coco_dir))
+    # Keep the COCO cache keyed to the split scheme so leave-camera-out and native
+    # exports never collide on disk.
+    _base = Path(args.coco_dir)
+    suffix = f"_locamout{args.val_camera_frac:g}_s{args.split_seed}" if args.val_camera_frac > 0 else "_native"
+    coco_dir = _base.parent / (_base.name + suffix)
+    coco_dir = export_hafnia_to_coco(
+        args.dataset_name, args.dataset_version, coco_dir,
+        val_camera_frac=args.val_camera_frac, split_seed=args.split_seed,
+    )
 
     pretrain_kwargs = {}
     if _BUNDLED_PRETRAIN.exists():
