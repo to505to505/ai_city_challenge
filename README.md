@@ -298,7 +298,7 @@ This repository is laid out as a **Hafnia trainer package** that fine-tunes
 | `resolution`        | 704   | RF-DETR Large default; must be divisible by `patch*windows = 32` |
 | `patch_size`        | 16    | architectural — do not change                              |
 | `num_windows`       | 2     | architectural — do not change                              |
-| `pretrain_weights`  | `rf-detr-large-2026.pth` | downloaded on first run by RF-DETR |
+| `pretrain_weights`  | `rf-detr-large-2026.pth` | bundled in `weights/` via `scripts/download_weights.py` (offline platform can't fetch at runtime) |
 | `dataset_file`      | `roboflow` | matches the layout `to_coco_format` writes             |
 | `batch_size × grad_accum` | 8 × 1 = 8 | empirically measured ~12-13 GB on T4 (probe + real-train) — fits with ~3 GB headroom |
 | `multi_scale` / `expanded_scales` | `false` | off for Lite (would push activations past 704 on T4); flip to `true` on Scale |
@@ -334,6 +334,10 @@ training on top of these.
 ### How to run
 
 ```bash
+# 0. Populate ./weights (gitignored, so a fresh clone has none). The offline
+#    platform can't download at runtime, so the Dockerfile bundles weights/.
+python scripts/download_weights.py        # idempotent, MD5-verified
+
 # Local dry-run (uses the 300-image sample dataset, single T4)
 python scripts/train.py --epochs 3
 

@@ -374,6 +374,7 @@ CLI команды НЕТ. Варианты:
   [ ] .hafniaignore исключает .data/, .git/, visualization/, README.md
   [ ] requirements.txt включает hafnia, torch, rfdetr-зависимости
   [ ] Все pretrained-веса лежат в weights/, и Dockerfile их COPY (network isolation!)
+      -> на чистом клоне: `python scripts/download_weights.py` (idempotent, MD5-verified)
   [ ] Скрипт передаёт pretrain_weights=<абсолютный путь> в модель
   [ ] Локально через `docker run -e HAFNIA_CLOUD=true -v <sample>:/opt/ml/input/data/training`
       пробежала ХОТЯ БЫ 1 эпоха без ошибок
