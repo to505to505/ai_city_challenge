@@ -186,9 +186,15 @@ train_test.py
 # test artifacts
 test_visualizations/
 
-# datasets
-data/
-datasets/
+# data dirs — ANCHORED to the rf-detr root (leading slash) so they only match
+# ./data and ./datasets, NOT the source package src/rfdetr/datasets/, which is
+# required at import time (rfdetr.detr imports rfdetr.datasets.{coco,yolo}).
+/data/
+/datasets/
+# belt-and-suspenders: keep the source package's .py tracked even if a broad
+# `datasets/` rule is reintroduced (bytecode stays ignored via __pycache__).
+!src/rfdetr/datasets/
+!src/rfdetr/datasets/**/*.py
 
 debugging/
 
