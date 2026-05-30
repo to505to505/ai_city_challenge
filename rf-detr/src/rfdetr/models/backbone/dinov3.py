@@ -21,9 +21,12 @@ an HF token). With ``load_weights=False`` the backbone is random-initialized —
 RF-DETR plumbing (shapes), but not for real training.
 """
 
+import os
+from pathlib import Path
+
 import torch
 import torch.nn as nn
-from transformers import AutoBackbone, DINOv3ViTBackbone, DINOv3ViTConfig
+from transformers import DINOv3ViTBackbone, DINOv3ViTConfig
 
 from rfdetr.utilities.logger import get_logger
 
@@ -32,12 +35,29 @@ logger = get_logger()
 # DINOv3 ViT sizes -> embedding width (same convention as DinoV2's size_to_width).
 size_to_width = {"small": 384, "base": 768, "large": 1024}
 
-# Default HF repo per size (LVD-1689M pretraining). Gated — requires license acceptance + token.
-size_to_hf_name = {
-    "small": "facebook/dinov3-vits16-pretrain-lvd1689m",
-    "base": "facebook/dinov3-vitb16-pretrain-lvd1689m",
-    "large": "facebook/dinov3-vitl16-pretrain-lvd1689m",
+# HF repo basenames (LVD-1689M pretraining). Gated on the Hub — but if a copy is bundled under the
+# project's weights/<basename>/ (config.json + model.safetensors) we load that offline instead.
+size_to_repo = {
+    "small": "dinov3-vits16-pretrain-lvd1689m",
+    "base": "dinov3-vitb16-pretrain-lvd1689m",
+    "large": "dinov3-vitl16-pretrain-lvd1689m",
 }
+
+
+def _resolve_model_path(size: str) -> str:
+    """Prefer a locally bundled HF model dir (offline); else the gated HF repo id."""
+    basename = size_to_repo[size]
+    env = os.environ.get("RFDETR_DINOV3_DIR")
+    if env and (Path(env) / "config.json").exists():
+        return env
+    # weights/<basename> lives at the project root — same relative layout locally and on the
+    # platform (/opt/recipe/weights). dinov3.py is rf-detr/src/rfdetr/models/backbone/dinov3.py.
+    here = Path(__file__).resolve()
+    for up in (5, 4, 6):
+        cand = here.parents[up] / "weights" / basename
+        if (cand / "config.json").exists():
+            return str(cand)
+    return f"facebook/{basename}"  # gated fallback
 
 # Architecture presets for RANDOM-INIT (offline / no gated weights) — standard ViT-S/B/L @ patch16.
 size_to_arch = {
@@ -67,13 +87,13 @@ class DinoV3(nn.Module):
         self.patch_size = patch_size
         self.num_windows = 1  # RoPE: no windowing
         out_features = [f"stage{i}" for i in out_feature_indexes]
-        name = hf_name or size_to_hf_name[size]
+        name = hf_name or _resolve_model_path(size)
 
         if load_weights:
-            # AutoBackbone routes to DINOv3ViTBackbone for these repos; out_features selects layers.
-            # DINOv3 weights are HF-GATED — accept the license + set HF_TOKEN, or bundle them offline.
+            # Use the explicit class (AutoBackbone mis-routes local dirs to its timm loader).
+            # `name` is a local bundled dir when available, else the (gated) HF repo id.
             try:
-                self.encoder = AutoBackbone.from_pretrained(name, out_features=out_features, return_dict=True)
+                self.encoder = DINOv3ViTBackbone.from_pretrained(name, out_features=out_features)
                 logger.info("DinoV3: loaded pretrained backbone %s (out_features=%s)", name, out_features)
             except Exception as exc:  # noqa: BLE001 — gated repo / offline / missing token
                 logger.warning(
