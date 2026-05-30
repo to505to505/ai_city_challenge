@@ -107,7 +107,9 @@ def export_yolo(dataset_name: str, version: str, out_dir: Path, val_frac: float,
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--model", default="yolo11l", help="yolo11n/s/m/l/x — bundled as weights/<model>.pt")
+    p.add_argument("--model", default="yolo26l",
+                   help="latest is yolo26* (Jan 2026, NMS-free + ProgLoss/STAL for small objects); "
+                        "bundled as weights/<model>.pt for the offline platform")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--imgsz", type=int, default=1280, help="YOLO's high-res strength (cheap vs RF-DETR)")
     p.add_argument("--batch", type=int, default=-1, help="-1 = ultralytics auto-batch (fits ~60% VRAM)")
@@ -171,15 +173,16 @@ def main() -> None:
             except Exception as exc:  # noqa: BLE001
                 print(f"[ckpt] copy best.pt failed: {exc!r}")
 
+    run_name = args.model
     model = YOLO(str(weights))
     model.add_callback("on_fit_epoch_end", on_fit_epoch_end)
     model.train(
         data=str(data_yaml), epochs=args.epochs, imgsz=args.imgsz, batch=args.batch,
-        device=args.devices, project=str(ckpt_dir), name="yolo11", exist_ok=True,
+        device=args.devices, project=str(ckpt_dir), name=run_name, exist_ok=True,
         patience=args.patience, plots=False, verbose=True,
     )
     # Final copy of best.pt
-    best = ckpt_dir / "yolo11" / "weights" / "best.pt"
+    best = ckpt_dir / run_name / "weights" / "best.pt"
     if best.exists():
         shutil.copy2(best, model_dir / "best.pt")
     print(f"[done] best.pt in {model_dir}")
