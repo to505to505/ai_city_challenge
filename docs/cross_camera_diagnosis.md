@@ -104,6 +104,14 @@ tile-merging adds false positives (edge-cut / duplicate boxes), so precision and
 A real test-time win needs WBF merging + edge-box filtering + score calibration; the cleaner fix is
 to push resolution into training.
 
+**Update — tuned SAHI tested** (`scripts/test_sahi_wbf.py`: WBF + tile-edge filtering + tile_thr 0.25):
+recovered most of the precision (mAP@50:95 0.329 → **0.360**, mAP@50 0.479 → 0.497) and kept the
+recall gain (small 33 % → 64 %, medium 51 % → 70 %), but **still did not beat baseline mAP (0.375)**,
+and mAR@100 dropped (0.61 → 0.57). Reason: tiled boxes are recovered but **loosely localized** (good
+at IoU 0.5, poor at 0.75–0.95), so recall@0.5 rises while IoU-averaged mAP does not. WBF ≈ NMS here
+(the edge filter did the work). **Verdict: SAHI is not a clean test-time win — pursue higher-res
+training (B) so the model emits well-localized small-object boxes natively.**
+
 ## Pitfalls discovered (don't get fooled again)
 
 - **Lightning sanity-check pollutes "best" metrics.** `num_sanity_val_steps` defaults to 2 → a
