@@ -413,6 +413,17 @@ def parse_args() -> argparse.Namespace:
         help="step = RF-DETR default (lr_drop); cosine = decay toward ~0 over --epochs "
              "(better for short fine-tunes off a converged checkpoint).",
     )
+    p.add_argument(
+        "--multi-scale",
+        action="store_true",
+        help="vary input resolution per batch (scale robustness — the lever for small-object / "
+             "cross-camera generalization). Costs more VRAM (peaks above --resolution).",
+    )
+    p.add_argument(
+        "--expanded-scales",
+        action="store_true",
+        help="wider multi-scale range (even more VRAM; use only with small --batch-size).",
+    )
     # NOTE: Hafnia Training-aaS containers are network-isolated — wandb.ai is unreachable.
     # Keep --wandb only for local runs. HafniaLogger writes via the platform's VPC MLflow.
     p.add_argument("--wandb", action="store_true", help="local only — W&B is blocked in Hafnia cloud")
@@ -450,6 +461,8 @@ def main() -> None:
             "split_seed": args.split_seed,
             "aug_preset": args.aug_preset,
             "init_weights": args.init_weights,
+            "multi_scale": args.multi_scale,
+            "expanded_scales": args.expanded_scales,
             "augmentations": aug,
         }
     )
@@ -527,10 +540,11 @@ def main() -> None:
             lr_scheduler=args.lr_scheduler,
             class_names=CLASS_NAMES,
             aug_config=aug,
-            # multi_scale + expanded_scales make per-batch resolution vary up to 768 — too risky
-            # on a single 16 GB T4 at base resolution 704. Disable both for Lite; flip to True on Scale.
-            multi_scale=False,
-            expanded_scales=False,
+            # multi_scale varies per-batch resolution (scale robustness — key for small objects /
+            # cross-camera). It raises peak VRAM well above --resolution, so pair --multi-scale with
+            # a small --batch-size (e.g. 2) + larger --grad-accum-steps on a 16 GB T4.
+            multi_scale=args.multi_scale,
+            expanded_scales=args.expanded_scales,
             square_resize_div_64=True,
             use_ema=True,
             tensorboard=True,
