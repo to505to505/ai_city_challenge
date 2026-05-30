@@ -19,6 +19,7 @@ import torch.nn.functional as F  # noqa: N812
 
 from rfdetr.models.backbone.base import BackboneBase
 from rfdetr.models.backbone.dinov2 import DinoV2
+from rfdetr.models.backbone.dinov3 import DinoV3
 from rfdetr.models.backbone.projector import MultiScaleProjector
 from rfdetr.utilities.logger import get_logger
 from rfdetr.utilities.tensors import NestedTensor
@@ -59,7 +60,10 @@ class Backbone(BackboneBase):
         # the last part of the name should be the size
         # and the start should be dinov2
         name_parts = name.split("_")
-        assert name_parts[0] == "dinov2"
+        encoder_family = name_parts[0]
+        assert encoder_family in ("dinov2", "dinov3"), (
+            f"encoder name must start with 'dinov2' or 'dinov3', got {name!r}"
+        )
         # name_parts[-1]
         use_registers = False
         if "registers" in name_parts:
@@ -70,21 +74,34 @@ class Backbone(BackboneBase):
             use_windowed_attn = True
             name_parts.remove("windowed")
         assert len(name_parts) == 2, (
-            "name should be dinov2, then either registers, windowed, both, or none, then the size"
+            "name should be dinov2/dinov3, then either registers, windowed, both, or none, then the size"
         )
-        self.encoder = DinoV2(
-            size=name_parts[-1],
-            out_feature_indexes=out_feature_indexes,
-            shape=target_shape,
-            use_registers=use_registers,
-            use_windowed_attn=use_windowed_attn,
-            gradient_checkpointing=gradient_checkpointing,
-            load_dinov2_weights=load_dinov2_weights,
-            patch_size=patch_size,
-            num_windows=num_windows,
-            positional_encoding_size=positional_encoding_size,
-            drop_path_rate=drop_path,
-        )
+        if encoder_family == "dinov3":
+            # DINOv3: RoPE backbone, no windowing / no learned-PE (see dinov3.py). The 'windowed'
+            # and 'registers' name flags are ignored (DINOv3 ViT bakes registers in / uses RoPE).
+            if use_windowed_attn:
+                logger.warning("DINOv3 has no windowed-attn variant — ignoring 'windowed' in %r.", name)
+            self.encoder = DinoV3(
+                size=name_parts[-1],
+                out_feature_indexes=out_feature_indexes,
+                shape=target_shape,
+                patch_size=patch_size,
+                load_weights=load_dinov2_weights,
+            )
+        else:
+            self.encoder = DinoV2(
+                size=name_parts[-1],
+                out_feature_indexes=out_feature_indexes,
+                shape=target_shape,
+                use_registers=use_registers,
+                use_windowed_attn=use_windowed_attn,
+                gradient_checkpointing=gradient_checkpointing,
+                load_dinov2_weights=load_dinov2_weights,
+                patch_size=patch_size,
+                num_windows=num_windows,
+                positional_encoding_size=positional_encoding_size,
+                drop_path_rate=drop_path,
+            )
         # build encoder + projector as backbone module
         if freeze_encoder:
             for param in self.encoder.parameters():
