@@ -16,3 +16,6 @@ pycocotools
 albumentations
 tensorboard
 wandb
+
+# YOLO11 comparison trainer (scripts/train_yolo.py)
+ultralytics

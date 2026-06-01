@@ -13,7 +13,11 @@ import torch
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_core import PydanticUndefined
 
-EncoderName: TypeAlias = Literal["dinov2_windowed_small", "dinov2_windowed_base", "dinov2_registers_windowed_small"]
+EncoderName: TypeAlias = Literal[
+    "dinov2_windowed_small", "dinov2_windowed_base", "dinov2_registers_windowed_small",
+    # DINOv3 ViT (RoPE, non-windowed) — see models/backbone/dinov3.py. Weights are HF-gated.
+    "dinov3_small", "dinov3_base", "dinov3_large",
+]
 
 
 class PretrainWeightsCompatibilityWarning(UserWarning):
@@ -462,7 +466,9 @@ class RFDETRMediumConfig(RFDETRBaseConfig):
 
 # res 704, ps 16, 2 windows, 4 dec layers, 300 queries, ViT-S basis
 class RFDETRLargeConfig(ModelConfig):
-    encoder: Literal["dinov2_windowed_small"] = "dinov2_windowed_small"
+    # Broadened from Literal["dinov2_windowed_small"] so the DINOv3 ViT-S backbone (dinov3_small)
+    # can be swapped in for experiments — same ViT-S width (384), RoPE instead of windowed learned-PE.
+    encoder: EncoderName = "dinov2_windowed_small"
     hidden_dim: int = 256
     dec_layers: int = 4
     sa_nheads: int = 8
