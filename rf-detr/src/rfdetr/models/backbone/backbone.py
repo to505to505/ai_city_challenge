@@ -81,12 +81,20 @@ class Backbone(BackboneBase):
             # and 'registers' name flags are ignored (DINOv3 ViT bakes registers in / uses RoPE).
             if use_windowed_attn:
                 logger.warning("DINOv3 has no windowed-attn variant — ignoring 'windowed' in %r.", name)
+            # ALWAYS load the bundled DINOv3 self-supervised weights — do NOT gate on
+            # `load_dinov2_weights` (which is False whenever a `pretrain_weights` checkpoint is
+            # given). That flag means "the RF-DETR checkpoint will supply the backbone", but an
+            # RF-DETR checkpoint carries a DINOv2 backbone whose keys can never populate a DINOv3
+            # (RoPE) backbone — so honoring the flag would leave DINOv3 RANDOM-init. We instead load
+            # DINOv3's pretrained weights here; if the checkpoint happens to be a DINOv3-RF-DETR one,
+            # its matching backbone keys overwrite these later in load_pretrain_weights (correct in
+            # both cases).
             self.encoder = DinoV3(
                 size=name_parts[-1],
                 out_feature_indexes=out_feature_indexes,
                 shape=target_shape,
                 patch_size=patch_size,
-                load_weights=load_dinov2_weights,
+                load_weights=True,
             )
         else:
             self.encoder = DinoV2(

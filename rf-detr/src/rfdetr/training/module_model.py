@@ -23,6 +23,7 @@ from rfdetr.models.lwdetr import build_criterion_from_config, build_model_from_c
 from rfdetr.models.weights import apply_lora, interpolate_position_embeddings, load_pretrain_weights
 from rfdetr.training.param_groups import get_param_dict
 from rfdetr.utilities.logger import get_logger
+from rfdetr.utilities.tensors import NestedTensor
 
 logger = get_logger()
 
@@ -84,6 +85,98 @@ class RFDETRModelModule(LightningModule):
             torch._dynamo.config.capture_scalar_outputs = True
             self.model = torch.compile(self.model, dynamic=True)
 
+        # CD-FKD: a forward hook on the Backbone captures its output feature maps so the
+        # student (corrupted) pass can be feature-matched to the teacher (clean) pass. Only
+        # registered when enabled, so the default training path is byte-identical.
+        self._cdfkd_feats: Optional[list] = None
+        if train_config.cd_fkd:
+            core = getattr(self.model, "_orig_mod", self.model)
+            core.backbone[0].register_forward_hook(lambda _m, _i, out: setattr(self, "_cdfkd_feats", out))
+            logger.info(
+                "CD-FKD enabled (global feature mimic): alpha=%.3f min_scale=%.2f noise_std=%.3f",
+                train_config.cd_fkd_alpha, train_config.cd_fkd_min_scale, train_config.cd_fkd_noise_std,
+            )
+
+    # ------------------------------------------------------------------
+    # CD-FKD helpers (single-source domain-generalization self-distillation)
+    # ------------------------------------------------------------------
+
+    def _cdfkd_corrupt(self, samples: NestedTensor) -> NestedTensor:
+        """Build the corrupted student view: random downscale↓↑ (small-object sim) + light noise/brightness.
+
+        Operates on the already-normalized, on-device image tensors; the padding mask is shared with the clean
+        view. Deterministic per global step (mirrors the multi-scale convention in ``on_train_batch_start``).
+
+        Args:
+            samples: Clean batch as a NestedTensor (``tensors`` = ``(B, 3, H, W)``, ``mask`` = ``(B, H, W)``).
+
+        Returns:
+            A new NestedTensor with corrupted ``tensors`` and the original ``mask``.
+        """
+        tc = self.train_config
+        x = samples.tensors
+        h, w = x.shape[-2:]
+        rng = random.Random(self.trainer.global_step)
+        factor = rng.uniform(tc.cd_fkd_min_scale, 1.0)
+        h2, w2 = max(32, int(round(h * factor))), max(32, int(round(w * factor)))
+        with torch.no_grad():
+            xc = F.interpolate(x, size=(h2, w2), mode="bilinear", align_corners=False)
+            xc = F.interpolate(xc, size=(h, w), mode="bilinear", align_corners=False)
+            if tc.cd_fkd_noise_std > 0:
+                xc = xc + torch.randn_like(xc) * tc.cd_fkd_noise_std
+            xc = xc * rng.uniform(0.7, 1.3)  # brightness/contrast-ish perturbation (normalized space)
+        return NestedTensor(xc, samples.mask)
+
+    def _cdfkd_global_mimic(self, feat_s: list, feat_t: list) -> torch.Tensor:
+        """Mean ``1 - cosine`` between student and detached-teacher backbone feature maps, per level.
+
+        Args:
+            feat_s: Student backbone output — list of NestedTensor (or tensors), grad-enabled.
+            feat_t: Teacher backbone output — list of NestedTensor (or tensors), used detached.
+
+        Returns:
+            Scalar feature-mimic loss.
+        """
+        def _t(f: Any) -> torch.Tensor:
+            return f.tensors if hasattr(f, "tensors") else f
+
+        total = _t(feat_s[0]).new_zeros(())
+        n = 0
+        for fs, ft in zip(feat_s, feat_t):
+            ts, tt = _t(fs), _t(ft).detach()
+            if ts.shape != tt.shape:
+                continue
+            total = total + (1.0 - F.cosine_similarity(ts, tt, dim=1)).mean()
+            n += 1
+        return total / max(1, n)
+
+    def _cdfkd_training_loss(
+        self, samples: NestedTensor, targets: Any
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Compute the CD-FKD training loss: detection on the corrupted student + global feature mimic to clean.
+
+        Args:
+            samples: Clean batch NestedTensor.
+            targets: List of per-image target dicts.
+
+        Returns:
+            ``(loss, loss_dict)`` where ``loss`` includes the mimic term and ``loss_dict`` carries the (detached)
+            ``cd_fkd_mimic`` scalar for logging alongside the detection sub-losses.
+        """
+        core = getattr(self.model, "_orig_mod", self.model)
+        # Teacher: CLEAN image, backbone-only, no grad (cheap — skips the transformer head).
+        with torch.no_grad():
+            feat_t = core.backbone[0](samples)
+        # Student: CORRUPTED image, full forward (hook captures its backbone features).
+        outputs = self.model(self._cdfkd_corrupt(samples), targets)
+        feat_s = self._cdfkd_feats
+        loss_dict = dict(self.criterion(outputs, targets))
+        weight_dict = self.criterion.weight_dict
+        det_loss = sum(loss_dict[k] * weight_dict[k] for k in loss_dict if k in weight_dict)
+        mimic = self._cdfkd_global_mimic(feat_s, feat_t)
+        loss_dict["cd_fkd_mimic"] = mimic.detach()
+        return det_loss + self.train_config.cd_fkd_alpha * mimic, loss_dict
+
     # ------------------------------------------------------------------
     # PTL lifecycle hooks
     # ------------------------------------------------------------------
@@ -139,10 +232,14 @@ class RFDETRModelModule(LightningModule):
         """
         samples, targets = batch
         batch_size = len(targets)
-        outputs = self.model(samples, targets)
-        loss_dict = self.criterion(outputs, targets)
-        weight_dict = self.criterion.weight_dict
-        loss = sum(loss_dict[k] * weight_dict[k] for k in loss_dict if k in weight_dict)
+        if self.train_config.cd_fkd:
+            # Self-distillation path: detection on a corrupted student view + feature mimic to the clean teacher.
+            loss, loss_dict = self._cdfkd_training_loss(samples, targets)
+        else:
+            outputs = self.model(samples, targets)
+            loss_dict = self.criterion(outputs, targets)
+            weight_dict = self.criterion.weight_dict
+            loss = sum(loss_dict[k] * weight_dict[k] for k in loss_dict if k in weight_dict)
         # Normalise by grad-accum steps so the accumulated gradient matches the
         # legacy engine, which scales each sub-batch by 1/grad_accum_steps before
         # backward().  PTL accumulates full-scale gradients by default; dividing

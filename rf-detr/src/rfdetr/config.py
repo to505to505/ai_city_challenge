@@ -632,6 +632,15 @@ class TrainConfig(BaseModel):
     multi_scale: bool = True
     expanded_scales: bool = True
     do_random_resize_via_padding: bool = False
+    # --- CD-FKD: feature self-distillation for single-source domain generalization ---
+    # When True, training_step runs the backbone twice: a CLEAN (stop-grad) "teacher" pass and a
+    # downscaled+corrupted "student" pass, adding cd_fkd_alpha * (1 - cos(F_student, F_teacher)) so
+    # the student learns scale/corruption-invariant backbone features (targets small-object +
+    # unseen-camera shift). No external data/teacher needed. Off by default → normal path unchanged.
+    cd_fkd: bool = False
+    cd_fkd_alpha: float = 1.0  # weight of the global backbone feature-mimic loss
+    cd_fkd_min_scale: float = 0.4  # student view downscaled to U(min_scale,1.0)*size then back up (small-object sim)
+    cd_fkd_noise_std: float = 0.05  # gaussian-noise std (normalized-image space) added to the student view
     use_ema: bool = True
     ema_update_interval: int = 1
     num_workers: int = 2

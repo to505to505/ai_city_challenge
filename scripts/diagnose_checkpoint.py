@@ -39,6 +39,9 @@ from hafnia.dataset.hafnia_dataset import HafniaDataset  # noqa: E402
 from rfdetr import RFDETRLarge  # noqa: E402
 
 CKPT = sys.argv[1] if len(sys.argv) > 1 else str(REPO_ROOT / "weights" / "v5_best_ema.pth")
+# IMPORTANT: must match the resolution the checkpoint was TRAINED at (predict resizes input to this
+# square). v5/v6 = 704; v7 = 896. A mismatch silently corrupts the eval. Pass as 2nd arg.
+RES = int(sys.argv[2]) if len(sys.argv) > 2 else 704
 CLASS_NAMES = ["Vehicle.Car", "Vehicle.Pickup Truck", "Vehicle.Single Truck", "Vehicle.Combo Truck",
                "Vehicle.Heavy Duty Vehicle", "Vehicle.Trailer", "Vehicle.Motorcycle", "Vehicle.Bicycle",
                "Vehicle.Van", "Person"]
@@ -106,7 +109,8 @@ def match(preds, gts, iou_thr=IOU_THR):
 
 def main():
     print(f"[load] {CKPT}")
-    model = RFDETRLarge(num_classes=10, resolution=704, pretrain_weights=CKPT)
+    print(f"[load] resolution={RES}")
+    model = RFDETRLarge(num_classes=10, resolution=RES, pretrain_weights=CKPT)
     model.optimize_for_inference()
     ds = HafniaDataset.from_name("eccv-cross-city", version="1.0.0")
     df = ds.samples.with_columns(pl.col("camera_info").struct.field("name").alias("cam"))

@@ -5,7 +5,9 @@ hafnia>=0.7.9
 # Listing its runtime deps explicitly so `pip install -r requirements.txt` also works.
 torch>=2.2.0,<2.11
 torchvision>=0.17.0
-transformers>=5.1.0,<6.0.0
+# >=5.9.0 required for the DINOv3 ViT backbone (DINOv3ViTBackbone/DINOv3ViTConfig) used by the
+# dinov3_* encoder path; 5.9.0 is the version verified locally (scripts/check_dinov3_warmstart.py).
+transformers>=5.9.0,<6.0.0
 pytorch_lightning>=2.6,<3,!=2.6.2,!=2.6.3
 torchmetrics[detection]>=1.2
 supervision>=0.20
@@ -13,7 +15,8 @@ pydantic>=2.0
 pyDeprecate
 peft
 pycocotools
-albumentations
+# >=2.0 for OpticalDistortion(mode="fisheye") used by the fisheye_night aug preset (verified on 2.0.8).
+albumentations>=2.0.0
 tensorboard
 wandb
 
