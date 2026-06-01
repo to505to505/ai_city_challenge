@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import polars as pl
+import torch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 # rf-detr lives in the repo as a plain folder (not pip-installed) so we expose its source.
@@ -101,7 +102,36 @@ AUG_DG = {
     "Affine": {"scale": (0.9, 1.1), "translate_percent": (-0.05, 0.05), "rotate": (-5, 5), "p": 0.3},
 }
 
-AUG_PRESETS = {"baseline": AUG_CONFIG, "dg": AUG_DG}
+# Phase-3 preset: simulate the two camera types that hurt cross-camera most (diagnosed this run).
+#   * FISHEYE (primary, GEOMETRIC): OpticalDistortion(mode="fisheye") warps the image like the
+#     GRANDVIEW fisheye cam — the camera type higher-res alone (v7) only partly fixed (0.378->0.433).
+#     RF-DETR routes OpticalDistortion through a bbox-aware Compose, so boxes are warped+clipped with
+#     the image (verified). This is the genuinely NEW lever vs the photometric DG preset.
+#   * NIGHT (secondary, PHOTOMETRIC): darken + IR-grayscale + sensor noise + cool tint to mimic
+#     night / IR cameras. HONEST CAVEAT: photometric domain-randomization (the DG preset) did NOT
+#     move cross-camera mAP for us (v6 ~= v5), so night is the weaker side-bet; fisheye should drive
+#     any gain. All names/params are real Albumentations 2.x transforms (misconfigured ones are
+#     silently skipped by from_config, so this preset is verified to build 8/8 before launch).
+AUG_FISHEYE_NIGHT = {
+    "HorizontalFlip": {"p": 0.5},
+    # --- lens distortion: MILD + FRAME-FILLING to match the real cams. We verified (scripts/
+    # real_fisheye_check.py) that this dataset's "fisheye" cams (GRANDVIEW) are actually high-mounted
+    # WIDE-ANGLE that FILL the frame with only slight barrel — NOT strong fisheye, and with NO black
+    # corners. So: small distort_limit + border_mode=4 (cv2.BORDER_REFLECT_101) so corners are
+    # reflected, never black (black corners are an artifact the model could latch onto as a fake
+    # domain cue). boxes are auto-warped by the bbox-aware Compose. ---
+    "OpticalDistortion": {"distort_limit": (0.05, 0.20), "mode": "fisheye", "border_mode": 4, "p": 0.35},
+    # --- night: darken (always negative -> never brightens), gamma, IR-gray, ISO noise, cool tint ---
+    "RandomBrightnessContrast": {"brightness_limit": (-0.5, -0.05), "contrast_limit": (-0.15, 0.15), "p": 0.35},
+    "RandomGamma": {"gamma_limit": (110, 220), "p": 0.30},
+    "ToGray": {"p": 0.12},
+    "ISONoise": {"color_shift": (0.01, 0.05), "intensity": (0.1, 0.5), "p": 0.20},
+    "RGBShift": {"r_shift_limit": 10, "g_shift_limit": 10, "b_shift_limit": 25, "p": 0.20},
+    # mild geometry (cameras are fixed/mounted — no vertical flip, small rotation/scale only)
+    "Affine": {"scale": (0.9, 1.1), "translate_percent": (-0.05, 0.05), "rotate": (-5, 5), "p": 0.3},
+}
+
+AUG_PRESETS = {"baseline": AUG_CONFIG, "dg": AUG_DG, "fisheye_night": AUG_FISHEYE_NIGHT}
 
 
 def load_hafnia_dataset(dataset_name: str, version: str) -> HafniaDataset:
@@ -357,6 +387,44 @@ class TrainStreamingWatcher:
         print(f"[watcher] stopped — total rows published: {self._rows_published}, ckpts mirrored: {sorted(self._ckpt_mtime)}")
 
 
+def prepare_warmstart_for_encoder(init_path: Path, encoder: str, work_dir: Path) -> Path:
+    """Make a warm-start checkpoint safe for a DINOv3 backbone, returning the path to use.
+
+    RF-DETR's published checkpoint carries a DINOv2 backbone. Fine-tuning a DINOv3-backbone model
+    FROM it must NOT try to load those DINOv2 backbone tensors: they cannot populate a RoPE DINOv3
+    backbone, and load_state_dict raises on the first same-name/different-shape collision (e.g.
+    ``embeddings.mask_token`` is [1,384] in DINOv2 vs [1,1,384] in DINOv3). The DINOv3 backbone is
+    already initialised from its own bundled self-supervised weights, so here we drop every
+    ``backbone.0.encoder.*`` tensor from the checkpoint and keep only the projector / transformer /
+    detection-head weights to warm-start. The class head is resized by RF-DETR's own loader.
+
+    For a non-DINOv3 encoder, or a checkpoint that is already DINOv3 (no learned backbone
+    position-embeddings — the DINOv2 signature), the original path is returned unchanged.
+    """
+    if not encoder.startswith("dinov3"):
+        return init_path
+    ckpt = torch.load(init_path, map_location="cpu", weights_only=False)
+    sd = ckpt.get("model") if isinstance(ckpt, dict) else None
+    if not isinstance(sd, dict):
+        print(f"[model] warm-start {init_path.name}: unexpected checkpoint structure — passing through unchanged")
+        return init_path
+    backbone_prefix = "backbone.0.encoder."
+    # DINOv2 backbones carry learned position_embeddings; DINOv3 (RoPE) does not — use that as the
+    # signal that this checkpoint's backbone is a foreign family we must strip.
+    is_foreign_backbone = any(k.startswith(backbone_prefix) and "position_embeddings" in k for k in sd)
+    if not is_foreign_backbone:
+        return init_path
+    stripped = {k: v for k, v in sd.items() if not k.startswith(backbone_prefix)}
+    n_dropped = len(sd) - len(stripped)
+    ckpt["model"] = stripped
+    work_dir.mkdir(parents=True, exist_ok=True)
+    out_path = work_dir / f"warmstart_nobackbone_{init_path.stem}.pth"
+    torch.save(ckpt, out_path)
+    print(f"[model] {encoder}: stripped {n_dropped} DINOv2 backbone tensors from warm-start checkpoint "
+          f"→ {out_path.name}. Head/neck/transformer warm-started; DINOv3 backbone from bundled weights.")
+    return out_path
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--epochs", type=int, default=50)
@@ -377,6 +445,16 @@ def parse_args() -> argparse.Namespace:
              "find_unused_parameters=True — our patched trainer enables that for strategy='ddp'.",
     )
     p.add_argument("--resolution", type=int, default=RESOLUTION, help="must be divisible by 32 for RF-DETR Large")
+    p.add_argument(
+        "--encoder",
+        choices=["dinov2_windowed_small", "dinov3_small", "dinov3_base", "dinov3_large"],
+        default="dinov2_windowed_small",
+        help="backbone. Default 'dinov2_windowed_small' (RF-DETR Large stock, windowed DINOv2 ViT-S). "
+             "'dinov3_*' swaps in the DINOv3 ViT (RoPE, non-windowed): its bundled self-supervised "
+             "weights load for the backbone, and a DINOv2 warm-start checkpoint is reused for the "
+             "head/neck/transformer ONLY (DINOv2 backbone keys are stripped — they cannot populate a "
+             "RoPE backbone and would crash load_state_dict on shape mismatch).",
+    )
     p.add_argument("--dataset-name", default="eccv-cross-city")
     p.add_argument("--dataset-version", default="1.0.0")
     p.add_argument(
@@ -394,10 +472,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--split-seed", type=int, default=42, help="seed for which cameras are held out")
     p.add_argument(
         "--aug-preset",
-        choices=["baseline", "dg"],
+        choices=["baseline", "dg", "fisheye_night"],
         default="baseline",
-        help="baseline = mild reference augs; dg = stronger photometric+noise for domain "
-             "generalization (Phase 2). See AUG_DG.",
+        help="baseline = mild reference augs; dg = stronger photometric+noise (Phase 2); "
+             "fisheye_night = fisheye OpticalDistortion (geometric, targets the fisheye cam) + "
+             "night photometric (darken/IR-gray/noise). See AUG_FISHEYE_NIGHT.",
     )
     p.add_argument(
         "--init-weights",
@@ -424,6 +503,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="wider multi-scale range (even more VRAM; use only with small --batch-size).",
     )
+    p.add_argument(
+        "--cd-fkd",
+        action="store_true",
+        help="CD-FKD self-distillation for domain generalization: per step, run the backbone on a CLEAN "
+             "(teacher, no-grad) and a downscaled+corrupted (student) view, and add a feature-mimic loss so "
+             "the student learns scale/corruption-invariant features (targets small-object + cross-camera). "
+             "Uses ONLY our own data — no external teacher/data. Costs ~1.4-1.6x compute/step.",
+    )
+    p.add_argument("--cd-fkd-alpha", type=float, default=1.0, help="weight of the CD-FKD feature-mimic loss")
+    p.add_argument("--cd-fkd-min-scale", type=float, default=0.4,
+                   help="student view is downscaled to U(min_scale,1.0)x then back up (small-object simulation)")
+    p.add_argument("--cd-fkd-noise-std", type=float, default=0.05,
+                   help="gaussian-noise std (normalized-image space) added to the corrupted student view")
     # NOTE: Hafnia Training-aaS containers are network-isolated — wandb.ai is unreachable.
     # Keep --wandb only for local runs. HafniaLogger writes via the platform's VPC MLflow.
     p.add_argument("--wandb", action="store_true", help="local only — W&B is blocked in Hafnia cloud")
@@ -446,6 +538,7 @@ def main() -> None:
     logger.log_configuration(
         {
             "model": "RFDETRLarge",
+            "encoder": args.encoder,
             "resolution": args.resolution,
             "patch_size": 16,
             "num_classes": NUM_CLASSES,
@@ -463,6 +556,10 @@ def main() -> None:
             "init_weights": args.init_weights,
             "multi_scale": args.multi_scale,
             "expanded_scales": args.expanded_scales,
+            "cd_fkd": args.cd_fkd,
+            "cd_fkd_alpha": args.cd_fkd_alpha,
+            "cd_fkd_min_scale": args.cd_fkd_min_scale,
+            "cd_fkd_noise_std": args.cd_fkd_noise_std,
             "augmentations": aug,
         }
     )
@@ -491,6 +588,10 @@ def main() -> None:
     if init_path.exists():
         print(f"[model] init weights: {init_path}"
               + (" (warm-start / fine-tune)" if args.init_weights else " (bundled COCO-pretrain)"))
+        # When swapping in a DINOv3 backbone, drop the checkpoint's DINOv2 backbone tensors so the
+        # warm-start loads only head/neck/transformer (the DINOv3 backbone is already loaded from its
+        # bundled self-supervised weights). No-op for the default DINOv2 encoder.
+        init_path = prepare_warmstart_for_encoder(init_path, args.encoder, REPO_ROOT / ".data")
         pretrain_kwargs["pretrain_weights"] = str(init_path)
     elif is_hafnia_cloud_job():
         raise FileNotFoundError(
@@ -499,7 +600,9 @@ def main() -> None:
             "rebuild the trainer (see scripts/download_weights.py for the base weights)."
         )
 
-    model = RFDETRLarge(num_classes=NUM_CLASSES, resolution=args.resolution, **pretrain_kwargs)
+    model = RFDETRLarge(
+        num_classes=NUM_CLASSES, resolution=args.resolution, encoder=args.encoder, **pretrain_kwargs
+    )
 
     # Resolve once so the watcher and model.train() share the exact same directories.
     ckpt_dir = Path(logger.path_model_checkpoints())
@@ -545,6 +648,10 @@ def main() -> None:
             # a small --batch-size (e.g. 2) + larger --grad-accum-steps on a 16 GB T4.
             multi_scale=args.multi_scale,
             expanded_scales=args.expanded_scales,
+            cd_fkd=args.cd_fkd,
+            cd_fkd_alpha=args.cd_fkd_alpha,
+            cd_fkd_min_scale=args.cd_fkd_min_scale,
+            cd_fkd_noise_std=args.cd_fkd_noise_std,
             square_resize_div_64=True,
             use_ema=True,
             tensorboard=True,

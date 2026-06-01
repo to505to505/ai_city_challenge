@@ -45,3 +45,17 @@ rf-detr/mkdocs.yaml
 # (saves ~834 MB of upload).
 weights/cascade_rcnn_convnext-s_fpn_fp16_3x_det_bdd100k.pth
 weights/PROVENANCE.md
+
+# Checkpoints NOT used by the DINOv3 run (it warm-starts from rf-detr-large-2026.pth and loads the
+# DINOv3 backbone from weights/dinov3-vits16-pretrain-lvd1689m/). These are recoverable from the
+# platform's model artifacts, so we exclude them to shrink the trainer.zip upload by ~460 MB.
+# NOTE: weights/v5_best_ema.pth is the warm-start base for the fisheye/night run (v10) — it MUST
+# ship, so it is intentionally NOT excluded here.
+weights/v6_best_ema.pth
+weights/v6_best_regular_ep3.pth
+
+# Stray Ultralytics auto-download checkpoints (yolo11l/n/x.pt, yolo26l.pt) that land in the repo
+# root + weights/ during YOLO benchmarking. The RF-DETR DINOv3 run needs none of them (it uses
+# rf-detr-large-2026.pth and the DINOv3 .safetensors), so exclude every *.pt to keep trainer.zip
+# lean. RF-DETR's own pretrain weights are .pth/.safetensors, never .pt — so this is safe.
+*.pt

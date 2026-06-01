@@ -28,6 +28,7 @@ from rfdetr import RFDETRLarge  # noqa: E402
 HELDOUT_CAMS = {"5 POINTS WB", "GRANDVIEW - DELHI INT", "HWY 20 - OLD HWY WBA",
                 "LOCUST CONNECTOR NB", "NW ARTERIAL - CHAVENELLE INT", "US 61 - TWIN VALLEY INT"}
 CKPT = sys.argv[1] if len(sys.argv) > 1 else str(REPO_ROOT / "weights" / "v5_best_ema.pth")
+RES = int(sys.argv[2]) if len(sys.argv) > 2 else 704  # must match the checkpoint's train resolution
 COLS, ROWS, OV = 3, 2, 0.2
 FULL_THR, TILE_THR, OP_THR = 0.05, 0.25, 0.30
 NMS_IOU, WBF_IOU, EDGE_MARGIN = 0.55, 0.55, 4
@@ -131,7 +132,8 @@ def recall_by_size(preds, gts):
 
 def main():
     print(f"[load] {CKPT} | {COLS}x{ROWS} ov={OV} tile_thr={TILE_THR} edge_margin={EDGE_MARGIN}")
-    model = RFDETRLarge(num_classes=10, resolution=704, pretrain_weights=CKPT); model.optimize_for_inference()
+    print(f"[load] {CKPT} resolution={RES}")
+    model = RFDETRLarge(num_classes=10, resolution=RES, pretrain_weights=CKPT); model.optimize_for_inference()
     ds = HafniaDataset.from_name("eccv-cross-city", version="1.0.0")
     df = ds.samples.with_columns(pl.col("camera_info").struct.field("name").alias("cam"))
     held = df.filter(pl.col("split").is_in(["train", "validation"]) & pl.col("cam").is_in(list(HELDOUT_CAMS)))
