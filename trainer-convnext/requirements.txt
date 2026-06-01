@@ -1,0 +1,18 @@
+# Cascade-R-CNN/ConvNeXt trainer — non-OpenMMLab deps.
+# torch / torchvision come from the base image (pytorch:2.1.2-cuda12.1); DO NOT add them here.
+# mmengine / mmcv / mmdet / mmpretrain are installed via `mim` in the Dockerfile (prebuilt wheels).
+
+# Hafnia SDK — dataset access + experiment tracking (MLflow). Does not pin torch.
+hafnia>=0.7.9
+
+# NumPy 2 breaks torch 2.1 / mmcv 2.1 / pycocotools ABI — keep it on the 1.x line.
+numpy<2.0
+
+# NOTE: no albumentations — the pipeline uses mmdet-native transforms (PhotoMetricDistortion,
+# RandomAffine) to avoid the mmdet-Albu <-> albumentations>=1.4 key-validation incompatibility.
+
+# COCO dataset + CocoMetric.
+pycocotools
+
+# Pulled transitively by hafnia, listed so `pip install -r` alone also works.
+polars
