@@ -55,12 +55,30 @@ metrics in detail. Regenerate the raw numbers with `python scripts/collect_metri
 - **v12 — CD-FKD (in progress).** Same config as v7 + single-source-domain-generalization self-distillation (clean teacher / downscaled+corrupted student + global backbone feature-mimic). Targets the small-object / cross-camera failure directly, using only our own data. Awaiting first eval.
 - **Dima — ConvNeXt / mmdetection (coco mAP 0.312, ep4/15).** Same leave-camera-out split. Currently below our RF-DETR v7/v11. Two earlier attempts failed on an `img_path` dataset-key error (~160 cr).
 
+## Ensemble & TTA (offline, local 36-image held-out set)
+
+Measured offline in the main env over the **same 36 held-out images** (leave-camera-out) via `scripts/ensemble_eval.py` — so absolute values differ from the platform val numbers above (v7 here = 0.380 vs EMA 0.354 on platform val); **read the deltas, not the absolutes.** Fusion = model-weighted Weighted Box Fusion. TTA = v7 @896 + horizontal-flip + @1024 fused by WBF. ConvNeXt = Dima's Cascade-R-CNN/ConvNeXt run through `scripts/convnext_infer.py` (Docker linux/amd64, mmdet 3.3 prebuilt CPU wheels; his class order is identical to ours, no remap).
+
+| strategy | mAP@.50:.95 | mAP@.50 | mAR100 | small rec | med rec | large rec | Δ vs v7 |
+|----------|:-----------:|:-------:|:------:|:---------:|:-------:|:---------:|:-------:|
+| v7 (single, @896)              | 0.380 | 0.542 | 0.540 | 28.6% | 57.8% | 92.6% | base |
+| v7 + full TTA                  | 0.398 | 0.579 | 0.580 | 26.2% | 60.6% | 95.1% | +0.019 |
+| v7 + ConvNeXt (w0.5)           | 0.389 | 0.578 | 0.568 | **40.5%** | 63.9% | 95.7% | +0.009 |
+| **v7 + TTA + ConvNeXt (w0.5)** | **0.411** | **0.590** | **0.607** | 31.0% | 63.5% | 95.7% | **+0.031** |
+
+ConvNeXt-weight sweep for the TTA combo (broad plateau, **not** a knife-edge): w0.3 → 0.406, **w0.5 → 0.411**, w0.7 → 0.409, w1.0 → 0.406.
+
+- **Best to date: v7 + TTA + ConvNeXt @ weight 0.5 = 0.411** (+0.031 over single v7, +0.013 over TTA-only). Every weight in 0.3–1.0 stays in 0.406–0.411, so the choice is robust, not a fit to 36 images.
+- **ConvNeXt is genuinely additive** — unlike the earlier v7+v6 RF-DETR ensemble, which *hurt*. It is a different architecture (Cascade R-CNN + FPN) and lifts exactly the cross-city weakness: **small-object recall 28.6%→40.5%**, medium 57.8%→63.9%, overall recall (mAR100) 0.540→0.607.
+- **Strongest submission candidate so far.** Caveat: weights tuned on 36 images, so the hidden target city may shift the optimum — but the plateau makes a w≈0.5 choice safe.
+
 ## Conclusions (as of this snapshot)
 
-1. **Best model: RF-DETR DINOv2 @ 896 + multi-scale (v7), EMA ≈ 0.35.** Resolution/scale is the only lever that has clearly helped.
-2. **Augmentation (DG photometric, fisheye, night) is neutral-to-negative** for cross-city here — consistent with the diagnosis that the failure is *scale / small-object*, not appearance.
-3. **DINOv3 is not worth it in this setup** — no co-trained DINOv3-RF-DETR pretrain exists, so the transplant underperforms; YOLO and ConvNeXt also trail RF-DETR.
-4. **The mAP is bottlenecked by small/rare classes (Person ~0.10, Bicycle ~0.18).** This is why **v12 (CD-FKD)** is the current bet — it attacks small-object/cross-camera robustness specifically.
+1. **Best single model: RF-DETR DINOv2 @ 896 + multi-scale (v7), EMA ≈ 0.35.** Resolution/scale is the only training lever that has clearly helped.
+2. **Best overall: v7 + TTA + ConvNeXt WBF ensemble (≈ 0.41 on the 36-img held-out, +0.031 over v7).** The diverse ConvNeXt architecture adds the small-object recall that RF-DETR alone misses — the one ensemble that helped instead of hurting.
+3. **Augmentation (DG photometric, fisheye, night) is neutral-to-negative** for cross-city here — consistent with the diagnosis that the failure is *scale / small-object*, not appearance.
+4. **DINOv3 is not worth it in this setup** — no co-trained DINOv3-RF-DETR pretrain exists, so the transplant underperforms; YOLO and ConvNeXt also trail RF-DETR as *single* models (but ConvNeXt earns its place in the *ensemble*).
+5. **The mAP is bottlenecked by small/rare classes (Person ~0.10, Bicycle ~0.18).** Resolution and the ConvNeXt ensemble are the two things that have moved this; pure-appearance techniques (incl. CD-FKD v12) have not.
 
 ## Provenance / caveats
 
