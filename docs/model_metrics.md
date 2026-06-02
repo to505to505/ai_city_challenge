@@ -1,9 +1,11 @@
 # Model Metrics — ECCV 2026 AI City Challenge, Track 6 (Cross-City Object Detection)
 
-**Snapshot date:** 2026-06-01. **Task:** 10-class fine-grained traffic detection (8 vehicle subtypes + Person + Bicycle); train on source city, evaluate on a hidden target city.
+**Snapshot date:** 2026-06-02. **Task:** 10-class fine-grained traffic detection (8 vehicle subtypes + Person + Bicycle); train on source city, evaluate on a hidden target city.
 
 This file records, for every experiment run on the Hafnia platform (ours + Dima's), the validation
 metrics in detail. Regenerate the raw numbers with `python scripts/collect_metrics.py`.
+
+> **For the synthesis — what we learned and *why* — read [`findings.md`](findings.md).** This file is the raw data; that one is the story.
 
 ## Evaluation setup (so the numbers are comparable)
 
@@ -19,13 +21,14 @@ metrics in detail. Regenerate the raw numbers with `python scripts/collect_metri
 | **v7** | RF-DETR DINOv2, 896 + multi-scale, baseline aug | us | **0.354** | 0.357 | 0.485 | 0.382 | 0.649 | 0.493 | CANCELED | ~872 cr / 10.6 h |
 | **v11** | RF-DETR DINOv2, 896 + ms + fisheye/night aug | us | **0.344** | 0.332 | 0.463 | 0.361 | 0.634 | 0.476 | CANCELED (ep5) | ~1050 cr / 12.8 h |
 | v5 | RF-DETR DINOv2, 704, baseline (warm-start base) | us | ~0.32† | — | — | — | — | — | prior session | — |
-| Dima ConvNeXt | ConvNeXt (mmdetection) | Dima | n/a‡ | 0.312 | 0.465 | 0.352 | — | — | TRAINING (ep4/15) | in progress |
+| Dima ConvNeXt | ConvNeXt (mmdetection) | Dima | n/a‡ | 0.312 | 0.465 | 0.352 | — | — | **best.pth pulled — ensemble member** | done |
+| v14 | RF-DETR DINOv2, 896 + **letterbox** | us | ~0.309† | — | — | — | — | — | CANCELED / FAILED | — |
 | v6 | RF-DETR DINOv2, 704, DG aug (strong photometric) | us | 0.306 | 0.304 | 0.422 | 0.326 | 0.613 | 0.438 | SUCCEEDED | ~1193 cr / 14.5 h |
+| v12/v13 | RF-DETR DINOv2, 896 + ms + **CD-FKD** (α=1 / α=100) | us | ~0.30† | — | — | — | — | — | **CANCELED — failed (no-op objective)** | — |
 | v8 | YOLO26-L, 1280 (from COCO, not warm-started) | us | n/a‡ | 0.254 | ~0.36 | — | — | — | CANCELED (ep17) | ~1050 cr / 12.8 h |
 | v9 | RF-DETR **DINOv3**-S, 704, baseline | us | 0.239 | 0.232 | 0.343 | 0.248 | 0.501 | 0.361 | CANCELED | ~943 cr / 11.5 h |
-| **v12** | RF-DETR DINOv2, 896 + ms + **CD-FKD** | us | *pending* | *pending* | — | — | — | — | TRAINING | in progress |
 
-† v5: from the prior session; checkpoint saved at `weights/v5_best_ema.pth`; used as the warm-start base for v6/v7/v11/v12. Exact platform metrics not re-verified this snapshot.
+† Approximate / not re-verified this snapshot. v5: from the prior session (checkpoint `weights/v5_best_ema.pth`; warm-start base for v6/v7/v11/v12). v12/v13/v14: failed/cancelled runs whose exact best mAP isn't cleanly recoverable from the logs — value is from the prior root-cause analysis; the *verdict* (failed, below v7) is what matters, not the third decimal.
 ‡ "n/a" EMA: YOLO/mmdet log a single mAP (EMA/regular split not exposed the same way); the value shown is their reported COCO mAP.
 
 ## Per-class AP (best observed per class, regular model)
@@ -52,8 +55,9 @@ metrics in detail. Regenerate the raw numbers with `python scripts/collect_metri
 - **v6 — DG photometric aug (EMA 0.306).** Strong brightness/contrast/colour/noise at 704. ≈ v5 baseline → confirmed **photometric domain-randomization does not help** the cross-city gap.
 - **v9 — DINOv3 backbone (EMA 0.239).** DINOv3-S swapped into RF-DETR, warm-started from v5 with the DINOv2 backbone tensors stripped (head reused). **Underperforms** because the head was trained on DINOv2 features and the DINOv3 backbone was never co-trained for detection (no public DINOv3-RF-DETR pretrain) — a mismatched transplant, not a fair backbone comparison. Killed.
 - **v8 — YOLO26-L (mAP@50:95 0.254).** Trained from COCO pretrain (not from our data) at 1280 px. Peaked ~ep2 (pre-augmentation), then oscillated ~0.21–0.25; never approached RF-DETR. Killed.
-- **v12 — CD-FKD (in progress).** Same config as v7 + single-source-domain-generalization self-distillation (clean teacher / downscaled+corrupted student + global backbone feature-mimic). Targets the small-object / cross-camera failure directly, using only our own data. Awaiting first eval.
-- **Dima — ConvNeXt / mmdetection (coco mAP 0.312, ep4/15).** Same leave-camera-out split. Currently below our RF-DETR v7/v11. Two earlier attempts failed on an `img_path` dataset-key error (~160 cr).
+- **v12 / v13 — CD-FKD (~0.30, FAILED).** Same config as v7 + single-source-DG self-distillation (clean teacher / downscaled+corrupted student + global backbone feature-mimic). **Did not help, and we know why** (full analysis in `findings.md` §2): the DINOv2 backbone is *already* invariant to the corruption — cosine(clean, corrupted) features = **0.9953**, det-loss(corrupted) only **1.06×** clean — so the mimic target is ≈0 (no learning signal). v12 (α=1) was a no-op; v13 (α=100) just diverted ~26% of the backbone gradient away from detection → divergence. A no-op objective, **not** a code bug.
+- **v14 — letterbox (~0.309, below v7).** Aspect-preserving resize. Didn't help — aspect handling wasn't the bottleneck, scale is. (One attempt FAILED, retry CANCELED.)
+- **Dima — ConvNeXt / mmdetection (coco mAP 0.312).** Cascade R-CNN + ConvNeXt-Tiny, same leave-camera-out split. Below our RF-DETR as a *single* model — **but the most valuable ensemble member** (different architecture → uncorrelated errors → +0.013 mAP, the biggest ensemble win; see `findings.md` §3). `best.pth` pulled and run through `scripts/convnext_infer.py`. (Two earlier attempts failed on an `img_path` dataset-key error, ~160 cr.)
 
 ## Ensemble & TTA (offline, local 36-image held-out set)
 
