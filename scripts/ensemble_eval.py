@@ -24,6 +24,7 @@ from torchmetrics.detection import MeanAveragePrecision
 REPO = Path(__file__).resolve().parent.parent
 V7_CACHE = REPO / ".data" / "tta_ens_cache.pkl"
 CN_CACHE = REPO / ".data" / "convnext_preds.pkl"
+YL_CACHE = REPO / ".data" / "yolo26_preds.pkl"
 
 
 def iou(a, b):
@@ -99,24 +100,34 @@ def main():
         return
     v7 = pickle.load(open(V7_CACHE, "rb"))
     cn = pickle.load(open(CN_CACHE, "rb"))
+    yl = pickle.load(open(YL_CACHE, "rb")) if YL_CACHE.exists() else None
     assert len(v7) == len(cn), f"misaligned: v7 {len(v7)} vs convnext {len(cn)}"
+    if yl is not None:
+        assert len(v7) == len(yl), f"misaligned: v7 {len(v7)} vs yolo {len(yl)}"
     print(f"[eval] {len(v7)} imgs | v7 boxes {sum(len(r['preds']['v7_896']) for r in v7)} | "
-          f"convnext boxes {sum(len(c) for c in cn)}")
+          f"convnext boxes {sum(len(c) for c in cn)}" + (f" | yolo boxes {sum(len(c) for c in yl)}" if yl else ""))
 
     def v7p(i, k):
         return v7[i]["preds"].get(k, [])
 
+    def tta(i):
+        return [v7p(i, "v7_896"), v7p(i, "v7_896_flip"), v7p(i, "v7_1024")]
+
     STRATS = {
         "v7_baseline":      lambda i: v7p(i, "v7_896"),
-        "v7_full_tta":      lambda i: wbf_weighted([v7p(i, "v7_896"), v7p(i, "v7_896_flip"), v7p(i, "v7_1024")], [1, 1, 1]),
-        "v7+cn_w1.0":       lambda i: wbf_weighted([v7p(i, "v7_896"), cn[i]], [1.0, 1.0]),
+        "v7_full_tta":      lambda i: wbf_weighted(tta(i), [1, 1, 1]),
         "v7+cn_w0.5":       lambda i: wbf_weighted([v7p(i, "v7_896"), cn[i]], [1.0, 0.5]),
-        "v7+cn_w0.3":       lambda i: wbf_weighted([v7p(i, "v7_896"), cn[i]], [1.0, 0.3]),
-        "v7tta+cn_w0.3":    lambda i: wbf_weighted([v7p(i, "v7_896"), v7p(i, "v7_896_flip"), v7p(i, "v7_1024"), cn[i]], [1, 1, 1, 0.3]),
-        "v7tta+cn_w0.5":    lambda i: wbf_weighted([v7p(i, "v7_896"), v7p(i, "v7_896_flip"), v7p(i, "v7_1024"), cn[i]], [1, 1, 1, 0.5]),
-        "v7tta+cn_w0.7":    lambda i: wbf_weighted([v7p(i, "v7_896"), v7p(i, "v7_896_flip"), v7p(i, "v7_1024"), cn[i]], [1, 1, 1, 0.7]),
-        "v7tta+cn_w1.0":    lambda i: wbf_weighted([v7p(i, "v7_896"), v7p(i, "v7_896_flip"), v7p(i, "v7_1024"), cn[i]], [1, 1, 1, 1.0]),
+        "v7tta+cn_w0.5":    lambda i: wbf_weighted(tta(i) + [cn[i]], [1, 1, 1, 0.5]),  # prev best
     }
+    if yl is not None:
+        STRATS.update({
+            "yolo_solo":        lambda i: yl[i],  # standalone -> class-order check (expect ~0.25, not ~0)
+            "v7+yolo_w0.5":     lambda i: wbf_weighted([v7p(i, "v7_896"), yl[i]], [1.0, 0.5]),
+            "v7tta+yolo_w0.5":  lambda i: wbf_weighted(tta(i) + [yl[i]], [1, 1, 1, 0.5]),
+            "v7tta+cn+yl.5/.5": lambda i: wbf_weighted(tta(i) + [cn[i], yl[i]], [1, 1, 1, 0.5, 0.5]),
+            "v7tta+cn+yl.5/.3": lambda i: wbf_weighted(tta(i) + [cn[i], yl[i]], [1, 1, 1, 0.5, 0.3]),
+            "all3_cn.7yl.3":    lambda i: wbf_weighted(tta(i) + [cn[i], yl[i]], [1, 1, 1, 0.7, 0.3]),
+        })
     names = list(STRATS)
     mp = {k: MeanAveragePrecision(box_format="xyxy") for k in names}
     rs = {k: {s: [0, 0] for s in ("small", "medium", "large")} for k in names}
