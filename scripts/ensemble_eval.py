@@ -25,6 +25,7 @@ REPO = Path(__file__).resolve().parent.parent
 V7_CACHE = REPO / ".data" / "tta_ens_cache.pkl"
 CN_CACHE = REPO / ".data" / "convnext_preds.pkl"
 YL_CACHE = REPO / ".data" / "yolo26_preds.pkl"
+DN_CACHE = REPO / ".data" / "dinov3_preds.pkl"
 
 
 def iou(a, b):
@@ -101,11 +102,15 @@ def main():
     v7 = pickle.load(open(V7_CACHE, "rb"))
     cn = pickle.load(open(CN_CACHE, "rb"))
     yl = pickle.load(open(YL_CACHE, "rb")) if YL_CACHE.exists() else None
+    dn = pickle.load(open(DN_CACHE, "rb")) if DN_CACHE.exists() else None
     assert len(v7) == len(cn), f"misaligned: v7 {len(v7)} vs convnext {len(cn)}"
     if yl is not None:
         assert len(v7) == len(yl), f"misaligned: v7 {len(v7)} vs yolo {len(yl)}"
+    if dn is not None:
+        assert len(v7) == len(dn), f"misaligned: v7 {len(v7)} vs dinov3 {len(dn)}"
     print(f"[eval] {len(v7)} imgs | v7 boxes {sum(len(r['preds']['v7_896']) for r in v7)} | "
-          f"convnext boxes {sum(len(c) for c in cn)}" + (f" | yolo boxes {sum(len(c) for c in yl)}" if yl else ""))
+          f"convnext boxes {sum(len(c) for c in cn)}" + (f" | yolo boxes {sum(len(c) for c in yl)}" if yl else "")
+          + (f" | dinov3 boxes {sum(len(c) for c in dn)}" if dn else ""))
 
     def v7p(i, k):
         return v7[i]["preds"].get(k, [])
@@ -124,9 +129,20 @@ def main():
             "yolo_solo":        lambda i: yl[i],  # standalone -> class-order check (expect ~0.25, not ~0)
             "v7+yolo_w0.5":     lambda i: wbf_weighted([v7p(i, "v7_896"), yl[i]], [1.0, 0.5]),
             "v7tta+yolo_w0.5":  lambda i: wbf_weighted(tta(i) + [yl[i]], [1, 1, 1, 0.5]),
-            "v7tta+cn+yl.5/.5": lambda i: wbf_weighted(tta(i) + [cn[i], yl[i]], [1, 1, 1, 0.5, 0.5]),
             "v7tta+cn+yl.5/.3": lambda i: wbf_weighted(tta(i) + [cn[i], yl[i]], [1, 1, 1, 0.5, 0.3]),
-            "all3_cn.7yl.3":    lambda i: wbf_weighted(tta(i) + [cn[i], yl[i]], [1, 1, 1, 0.7, 0.3]),
+            "all3_cn.7yl.3":    lambda i: wbf_weighted(tta(i) + [cn[i], yl[i]], [1, 1, 1, 0.7, 0.3]),  # prev best
+        })
+    if dn is not None:
+        STRATS.update({
+            "dino_solo":        lambda i: dn[i],  # standalone -> class-order check (expect ~0.24, not ~0)
+            "v7tta+dino_w0.5":  lambda i: wbf_weighted(tta(i) + [dn[i]], [1, 1, 1, 0.5]),       # dino as 2nd model
+            "v7tta+dino_w0.3":  lambda i: wbf_weighted(tta(i) + [dn[i]], [1, 1, 1, 0.3]),
+            "v7tta+cn+dino.5/.3": lambda i: wbf_weighted(tta(i) + [cn[i], dn[i]], [1, 1, 1, 0.5, 0.3]),  # cn+dino, no yolo
+        })
+    if dn is not None and yl is not None:
+        STRATS.update({
+            "all4_cn.7yl.3dn.3": lambda i: wbf_weighted(tta(i) + [cn[i], yl[i], dn[i]], [1, 1, 1, 0.7, 0.3, 0.3]),
+            "all4_cn.7yl.3dn.5": lambda i: wbf_weighted(tta(i) + [cn[i], yl[i], dn[i]], [1, 1, 1, 0.7, 0.3, 0.5]),
         })
     names = list(STRATS)
     mp = {k: MeanAveragePrecision(box_format="xyxy") for k in names}

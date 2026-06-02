@@ -67,21 +67,25 @@ Measured offline in the main env over the **same 36 held-out images** (leave-cam
 | v7 + TTA + ConvNeXt (w0.5)     | 0.411 | 0.590 | 0.607 | 31.0% | 63.5% | 95.7% | +0.031 |
 | YOLO26 (v8) solo               | 0.206 | 0.288 | 0.268 | 14.3% | 42.2% | 79.0% | −0.174 |
 | v7 + TTA + YOLO26 (w0.5)       | 0.408 | 0.587 | 0.589 | 26.2% | 59.4% | 95.1% | +0.028 |
-| **v7 + TTA + ConvNeXt(.7) + YOLO26(.3)** | **0.417** | **0.595** | **0.618** | 28.6% | 62.7% | 95.7% | **+0.038** |
+| v7 + TTA + ConvNeXt(.7) + YOLO26(.3) | 0.417 | 0.595 | 0.618 | 28.6% | 62.7% | 95.7% | +0.038 |
+| DINOv3-RF-DETR (v9) solo       | 0.317 | 0.447 | 0.475 | 19.0% | 47.4% | 90.7% | −0.063 |
+| v7 + TTA + DINOv3 (w0.5)       | 0.402 | 0.575 | 0.588 | 26.2% | 60.2% | 94.4% | +0.022 |
+| **v7 + TTA + ConvNeXt(.7) + YOLO26(.3) + DINOv3(.5)** | **0.419** | 0.590 | **0.623** | 26.2% | 61.0% | 95.7% | **+0.040** |
 
-ConvNeXt-weight sweep for the TTA combo (broad plateau, **not** a knife-edge): w0.3 → 0.406, **w0.5 → 0.411**, w0.7 → 0.409, w1.0 → 0.406. Adding YOLO26 on top (all 3 models): cn.5/yl.5 → 0.416, cn.5/yl.3 → 0.416, **cn.7/yl.3 → 0.417** — all clustered, so YOLO's contribution is small but stable, not a single lucky weight.
+ConvNeXt-weight sweep for the TTA combo (broad plateau, **not** a knife-edge): w0.3 → 0.406, **w0.5 → 0.411**, w0.7 → 0.409, w1.0 → 0.406. Adding YOLO26 (3 models): cn.5/yl.5 → 0.416, cn.5/yl.3 → 0.416, **cn.7/yl.3 → 0.417**. Adding DINOv3 on top (4 models): dn.3 → 0.418, dn.5 → 0.419 — a +0.002 hair, within noise.
 
-- **Best to date: v7 + TTA + ConvNeXt + YOLO26 = 0.417** (+0.038 over single v7). The diminishing-returns ladder: TTA **+0.019**, then ConvNeXt **+0.013**, then YOLO26 **+0.006** — each added diverse model helps less.
-- **ConvNeXt is the big additive win** (unlike the earlier v7+v6 RF-DETR ensemble, which *hurt*): a different architecture (Cascade R-CNN + FPN) that lifts exactly the cross-city weakness — **small-object recall 28.6%→40.5%**, medium 57.8%→63.9%.
-- **YOLO26 is a marginal third** (+0.006, near the 36-image noise floor but consistently non-negative). It is sparse (537 boxes vs ConvNeXt 1025, v7 2433) and weak on small objects, so its gain is on medium/large refinement + overall recall (mAR100 0.607→0.618), a *different* axis than ConvNeXt — which is why it still adds a little.
-- **Strongest submission candidate: the 3-model WBF (cn 0.7, yolo 0.3).** Caveat: weights tuned on 36 images, so the hidden target city may shift the optimum — but every sweep point is a plateau, so the choice is safe.
+- **Best to date: 0.419** (4-model WBF), but the *honest* best is effectively the **3-model 0.417** — DINOv3 adds only +0.002, a statistical tie. Diminishing-returns ladder: TTA **+0.019**, ConvNeXt **+0.013**, YOLO26 **+0.006**, DINOv3 **+0.002**.
+- **ConvNeXt is the big additive win** (unlike v7+v6, two RF-DETRs, which *hurt*): a different architecture (Cascade R-CNN + FPN) that lifts the cross-city weakness — **small-object recall 28.6%→40.5%**, medium 57.8%→63.9%.
+- **YOLO26 is a marginal third** (+0.006): sparse (537 boxes) and weak on small objects, so it refines medium/large + overall recall (mAR100 0.607→0.618) — a *different* axis than ConvNeXt.
+- **DINOv3 demonstrates diversity > strength.** It is the **strongest standalone** of the three add-ons (solo 0.317 vs YOLO 0.206) yet the **weakest ensemble partner** (as the 2nd model: 0.402 vs YOLO's 0.408 vs ConvNeXt's 0.411). Reason: v9 shares v7's exact RF-DETR detection head, so its boxes are **correlated** with v7's and WBF extracts little novel signal. Its different DINOv3 backbone decorrelates it just enough to not *hurt* (cf. v6, same backbone → hurt), but not enough to help. **Verdict: not worth the 4th-model inference cost.**
+- **Strongest submission candidate: the 3-model WBF (ConvNeXt 0.7, YOLO26 0.3) = 0.417.** Caveat: weights tuned on 36 images, but every sweep point is a plateau, so the choice is safe.
 
 ## Conclusions (as of this snapshot)
 
 1. **Best single model: RF-DETR DINOv2 @ 896 + multi-scale (v7), EMA ≈ 0.35.** Resolution/scale is the only training lever that has clearly helped.
 2. **Best overall: v7 + TTA + ConvNeXt + YOLO26 WBF ensemble (≈ 0.42 on the 36-img held-out, +0.038 over v7).** ConvNeXt is the big additive win (small-object recall); YOLO26 is a marginal third (+0.006, different axis). Architecture diversity in WBF is the one ensemble pattern that helped instead of hurting (cf. v7+v6, two RF-DETRs, which *hurt*).
 3. **Augmentation (DG photometric, fisheye, night) is neutral-to-negative** for cross-city here — consistent with the diagnosis that the failure is *scale / small-object*, not appearance.
-4. **DINOv3 is not worth it in this setup** — no co-trained DINOv3-RF-DETR pretrain exists, so the transplant underperforms; YOLO and ConvNeXt also trail RF-DETR as *single* models (but ConvNeXt earns its place in the *ensemble*).
+4. **DINOv3 is not worth it — as a single model OR in the ensemble.** As a single model the transplant underperforms (no co-trained DINOv3-RF-DETR pretrain). In the ensemble it adds only +0.002 *despite* being the strongest of the three add-ons standalone (solo 0.317) — because it shares v7's RF-DETR head, its errors are correlated and WBF gains little. The clean lesson: **ensemble value = architectural diversity, not member strength** (weaker-but-diverse YOLO/ConvNeXt each add more than stronger-but-correlated DINOv3).
 5. **The mAP is bottlenecked by small/rare classes (Person ~0.10, Bicycle ~0.18).** Resolution and the ConvNeXt ensemble are the two things that have moved this; pure-appearance techniques (incl. CD-FKD v12) have not.
 
 ## Provenance / caveats
