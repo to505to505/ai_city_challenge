@@ -12,12 +12,12 @@ gap with a **leave-camera-out** split (6 whole cameras held out, none seen in tr
 
 ## TL;DR
 
-1. **Best single model:** `v7` — RF-DETR (DINOv2 windowed backbone) @ **896 px + multi-scale**, EMA ≈ **0.354**.
-2. **Best submission candidate:** a **3-model Weighted-Box-Fusion ensemble** — `v7 + TTA + ConvNeXt + YOLO26` ≈ **0.417** on the local held-out set (**+0.038** over v7 alone).
+1. **Best single model:** `v16` — RF-DETR @ **1120 px + multi-scale** (Dima), EMA **0.389**. The resolution ladder 896→1024→1120 = 0.354→0.376→0.389; 1120 is the practical ceiling (diminishing returns + VRAM).
+2. **Best submission candidate:** **`v16(native+flip) + ConvNeXt(0.7) + YOLO26(0.3) + VFNet(0.3–0.5)`** WBF ≈ **0.436** local (**+0.056** over single v7; v7 itself is subsumed and dropped). See §3 round 2.
 3. **The cross-city gap is SCALE / small-object, not appearance.** This single diagnosis explains every result below.
 4. **Every appearance-side technique failed** — DINOv3 backbone, CD-FKD self-distillation, photometric / fisheye / night augmentation — and we now understand *why each one* failed, not just *that* it did.
-5. **Ensembling law we confirmed empirically:** *value = architectural **diversity**, not member **strength***. A weaker-but-different model adds more than a stronger-but-similar one.
-6. **The ensemble is effectively maxed.** The only untested training lever with a plausible payoff is **higher resolution (1024)**.
+5. **Ensembling laws confirmed empirically:** value = **diversity along the failure axis** (resolution counts; same-res same-head doesn't), **decorrelated recall beats solo mAP** (VFNet 0.235-solo adds more than DINOv3 0.317-solo), and **every member needs ≥2 views** in the WBF pool.
+6. **Remaining levers:** final all-cameras retrain @1120 for submission; the Person blind spot is a class-imbalance training problem, out of ensemble reach.
 
 ---
 
@@ -89,22 +89,37 @@ signal. A different *backbone* (DINOv3 vs DINOv2) decorrelates it just enough to
 (contrast `v6`, which shared v7's backbone *and* head → it **hurt** the ensemble), but not enough to
 help. **Weaker-but-different beats stronger-but-similar.**
 
-### Why the ensemble is effectively complete
-We have exactly **three distinct detector families**, and all three are now in the ensemble:
-- **RF-DETR** (DETR transformer) → `v7`
-- **Cascade R-CNN + ConvNeXt** (two-stage CNN) → ConvNeXt
-- **YOLO26** (anchor-free CNN) → `v8`
+### Round 2 (2026-06-05): v16 anchor + VFNet — new best 0.436, and two refined laws
 
-Every *other* checkpoint we own (`v5/v6/v9/v11/v12/v13/v14`) is an **RF-DETR variant** — i.e. a clone of
-v7's head. By the diversity law they will all behave like DINOv3: correlated, contributing ≈0 or
-hurting. **There is no fourth diverse architecture left to add**, so the 3-model ensemble is the
-ceiling of this approach.
+Two additions re-opened the ceiling we thought we'd hit:
+
+```
+old best  v7tta + ConvNeXt(.7) + YOLO26(.3)                  0.417
+NEW BEST  v16(native+flip) + ConvNeXt(.7) + YOLO26(.3) + VFNet(.3-.5)   0.436  (+0.056 over v7 single)
+          (plateau 0.433–0.436 across compositions; v7 fully subsumed — dropped)
+```
+
+- **v16 = Dima's RF-DETR @1120** (EMA 0.389, best single). Swapping it in as anchor: +0.014.
+  **Law refined:** *diversity must lie along the failure axis.* Same-family RF-DETRs at **different
+  resolutions** (896 vs 1120) decorrelate where same-res (v6) hurt and same-head (DINOv3) added ~0 —
+  because resolution IS the scale axis, and scale is the cross-city failure.
+- **Law 2 — pair every member's views.** v16 with ONE view *dropped* the pool 0.417→0.396 (its unique
+  detections carry no agreement weight under WBF's conf normalization and dilute everyone else);
+  native+flip together → 0.431. Any new member must enter with ≥2 views (TTA).
+- **VFNet R-50 (trained for this purpose, 12 ep) is the mirror-image of DINOv3 and validates the
+  program:** worst solo mAP of the pool (0.235 local — loose boxes) but **best recall of all six
+  models** (overall 73.1%, **small 45.2%**, medium 65.5%) and **19 unique TP — the most irreplaceable
+  member** (ConvNeXt 4, v16 4, v7 1, YOLO 0, DINOv3 2). The dense anchor-free head over-fires on small
+  objects; WBF supplies the precision it lacks. **Ensemble value = decorrelated *recall*, not solo mAP.**
+- **Diversity audit after round 2:** shared blind spot shrank 24.5% → **19.0%** of GT; oracle union
+  recall 75.5% → ~80%. Greedy ladder: VFNet (331) → v16 (+24) → ConvNeXt (+7) → others ≈ 0.
+  The remaining 86 blind objects are still dominated by **Person** — unreachable by ensembling.
 
 ### Caveat (honesty)
 Ensemble weights are tuned on **36 images** — small. But every weight sweep is a **broad plateau**
-(ConvNeXt 0.3–1.0 all give 0.406–0.411; YOLO configs all 0.416–0.417), not a knife-edge, so the
-choices are robust rather than overfit to one lucky value. The hidden target city may still shift the
-optimum; low weights on the add-ons limit the downside.
+(round 1: ConvNeXt 0.3–1.0 all 0.406–0.411; round 2: all compositions 0.433–0.436), not a knife-edge,
+so the choices are robust rather than overfit to one lucky value. The hidden target city may still
+shift the optimum; low weights on the add-ons limit the downside.
 
 ---
 

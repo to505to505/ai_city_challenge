@@ -26,6 +26,8 @@ V7_CACHE = REPO / ".data" / "tta_ens_cache.pkl"
 CN_CACHE = REPO / ".data" / "convnext_preds.pkl"
 YL_CACHE = REPO / ".data" / "yolo26_preds.pkl"
 DN_CACHE = REPO / ".data" / "dinov3_preds.pkl"
+V16_CACHE = REPO / ".data" / "v16_preds.pkl"
+VF_CACHE = REPO / ".data" / "vfnet_preds.pkl"
 
 
 def iou(a, b):
@@ -143,6 +145,33 @@ def main():
         STRATS.update({
             "all4_cn.7yl.3dn.3": lambda i: wbf_weighted(tta(i) + [cn[i], yl[i], dn[i]], [1, 1, 1, 0.7, 0.3, 0.3]),
             "all4_cn.7yl.3dn.5": lambda i: wbf_weighted(tta(i) + [cn[i], yl[i], dn[i]], [1, 1, 1, 0.7, 0.3, 0.5]),
+        })
+    v16 = pickle.load(open(V16_CACHE, "rb")) if V16_CACHE.exists() else None
+    if v16 is not None:
+        n16, f16 = v16["v16_1120"], v16["v16_1120_flip"]
+
+        def t16(i):
+            return [n16[i], f16[i]]
+
+        STRATS.update({
+            "v16_solo":          lambda i: n16[i],  # class-order check + local solo (platform EMA 0.389)
+            "v16+flip":          lambda i: wbf_weighted(t16(i), [1, 1]),
+            "v16f+cn_w0.5":      lambda i: wbf_weighted(t16(i) + [cn[i]], [1, 1, 0.5]),
+            "v16f+cn+yl.7/.3":   lambda i: wbf_weighted(t16(i) + [cn[i], yl[i]], [1, 1, 0.7, 0.3]),
+            "v16f+v7tta+cn+yl":  lambda i: wbf_weighted(t16(i) + tta(i) + [cn[i], yl[i]], [1, 1, 0.7, 0.7, 0.7, 0.7, 0.3]),
+            "v16n+v7tta+cn+yl":  lambda i: wbf_weighted([n16[i]] + tta(i) + [cn[i], yl[i]], [1, 0.7, 0.7, 0.7, 0.7, 0.3]),
+            "v16f+v7tta+cn":     lambda i: wbf_weighted(t16(i) + tta(i) + [cn[i]], [1, 1, 0.7, 0.7, 0.7, 0.7]),
+            "v16hi+v7tta+cn+yl": lambda i: wbf_weighted(t16(i) + tta(i) + [cn[i], yl[i]], [1.5, 1.5, 0.7, 0.7, 0.7, 0.7, 0.3]),
+        })
+    vf = pickle.load(open(VF_CACHE, "rb")) if VF_CACHE.exists() else None
+    if vf is not None and v16 is not None:
+        STRATS.update({
+            "vfnet_solo":        lambda i: vf[i],  # class-order check (expect ~0.29, not ~0)
+            "v16f+cn+vf.5":      lambda i: wbf_weighted(t16(i) + [cn[i], vf[i]], [1, 1, 0.7, 0.5]),
+            "v16f+cn+yl+vf.3":   lambda i: wbf_weighted(t16(i) + [cn[i], yl[i], vf[i]], [1, 1, 0.7, 0.3, 0.3]),
+            "v16f+cn+yl+vf.5":   lambda i: wbf_weighted(t16(i) + [cn[i], yl[i], vf[i]], [1, 1, 0.7, 0.3, 0.5]),
+            "ALL(v7tta too)":    lambda i: wbf_weighted(t16(i) + tta(i) + [cn[i], yl[i], vf[i]], [1, 1, 0.7, 0.7, 0.7, 0.7, 0.3, 0.3]),
+            "ALL_no_yl":         lambda i: wbf_weighted(t16(i) + tta(i) + [cn[i], vf[i]], [1, 1, 0.7, 0.7, 0.7, 0.7, 0.3]),
         })
     names = list(STRATS)
     mp = {k: MeanAveragePrecision(box_format="xyxy") for k in names}

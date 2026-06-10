@@ -82,15 +82,40 @@ ConvNeXt-weight sweep for the TTA combo (broad plateau, **not** a knife-edge): w
 - **ConvNeXt is the big additive win** (unlike v7+v6, two RF-DETRs, which *hurt*): a different architecture (Cascade R-CNN + FPN) that lifts the cross-city weakness — **small-object recall 28.6%→40.5%**, medium 57.8%→63.9%.
 - **YOLO26 is a marginal third** (+0.006): sparse (537 boxes) and weak on small objects, so it refines medium/large + overall recall (mAR100 0.607→0.618) — a *different* axis than ConvNeXt.
 - **DINOv3 demonstrates diversity > strength.** It is the **strongest standalone** of the three add-ons (solo 0.317 vs YOLO 0.206) yet the **weakest ensemble partner** (as the 2nd model: 0.402 vs YOLO's 0.408 vs ConvNeXt's 0.411). Reason: v9 shares v7's exact RF-DETR detection head, so its boxes are **correlated** with v7's and WBF extracts little novel signal. Its different DINOv3 backbone decorrelates it just enough to not *hurt* (cf. v6, same backbone → hurt), but not enough to help. **Verdict: not worth the 4th-model inference cost.**
-- **Strongest submission candidate: the 3-model WBF (ConvNeXt 0.7, YOLO26 0.3) = 0.417.** Caveat: weights tuned on 36 images, but every sweep point is a plateau, so the choice is safe.
+- ~~Strongest submission candidate: the 3-model WBF = 0.417~~ **Superseded by the v16/VFNet round below.**
+
+## Ensemble round 2 — v16 (1120) anchor + VFNet member (2026-06-05)
+
+Two new members measured on the same 36-image held-out set: **v16** = Dima's RF-DETR @1120 (platform EMA **0.3886**, best single model; local solo 0.386 ✓ consistent) via `scripts/v16_infer.py` (native + h-flip passes), and **VFNet** = our VFNet R-50 (mmdet, trained 12 ep, platform 0.292; local solo 0.235) via `scripts/vfnet_infer.py` (Docker CPU stack, deform_conv CPU op works).
+
+| strategy | mAP@.50:.95 | mAP@.50 | mAR100 | small rec | med rec | Δ vs v7 |
+|----------|:-----------:|:-------:|:------:|:---------:|:-------:|:-------:|
+| v16 solo @1120                  | 0.386 | 0.565 | 0.575 | 33.3% | 57.8% | +0.006 |
+| v16 + flip (alone)              | 0.364 | 0.586 | 0.582 | 38.1% | 62.2% | −0.015 |
+| v16 native (1 view) + v7tta+cn+yl | 0.396 | 0.610 | 0.592 | 28.6% | 61.8% | +0.016 |
+| v16f + v7tta + cn(.7) + yl(.3)  | 0.431 | 0.632 | 0.624 | 35.7% | 63.5% | +0.051 |
+| VFNet solo                      | 0.235 | 0.347 | 0.519 | **45.2%** | **65.1%** | −0.145 |
+| **v16f + cn(.7) + yl(.3) + vf(.3-.5)** | **0.436** | 0.635 | 0.621 | 35.7% | 64.7% | **+0.056** |
+| ALL (v16f+v7tta+cn+yl+vf)       | 0.436 | **0.644** | **0.629** | 33.3% | 64.7% | +0.056 |
+
+Composition plateau 0.433–0.436 across weight/member variants — robust, not a knife-edge.
+
+**Findings of round 2:**
+
+1. **New best: 0.436 (+0.056 over single v7; +0.019 over the old 0.417).** Minimal best composition: **v16(native+flip) + ConvNeXt(0.7) + YOLO26(0.3) + VFNet(0.3–0.5)** — *v7 is fully subsumed* (1 unique TP left in the audit) and can be dropped from the submission pipeline.
+2. **Resolution diversity between same-family models WORKS** — v7@896/1024 + v16@1120 added +0.014 — *unlike* v6 (same arch, same res → hurt) and DINOv3 (same head → +0.002). Refined law: **diversity must lie along the failure axis (scale)**, not merely along architecture.
+3. **Pair every new member's views.** v16 native alone *dropped* the pool (0.417→0.396): its unique detections carry no agreement weight and dilute others under WBF's conf normalization. Native+flip together → +0.035 swing. (Flip *alone* hurts v16 — averaging blurs its tight boxes: mAP50 ↑, mAP50:95 ↓ — but inside a large pool agreement wins.)
+4. **VFNet validates "weak solo, valuable member" — the mirror of DINOv3.** Worst solo mAP (0.235, loose boxes) but **best recall of ALL six models** (overall 73.1%, small 45.2%, medium 65.5%) and **19 unique TP — the most irreplaceable member** (ConvNeXt 4, v16 4, v7 1, YOLO 0). The dense anchor-free head over-fires on small objects — exactly what WBF wants from a member; WBF supplies the precision it lacks. Its training run paid off where DINOv3's didn't: it is diverse along *both* the head paradigm *and* the recall/precision trade-off.
+5. **Diversity audit (6 members):** shared blind spot shrank **24.5% → 19.0%** of GT (111→86 objects); oracle union recall 75.5% → ~80%. Greedy ladder: VFNet (331 TP) → v16 (+24) → ConvNeXt (+7) → rest ≈ 0. Person remains the wall (most of the 86).
 
 ## Conclusions (as of this snapshot)
 
-1. **Best single model: RF-DETR DINOv2 @ 896 + multi-scale (v7), EMA ≈ 0.35.** Resolution/scale is the only training lever that has clearly helped.
-2. **Best overall: v7 + TTA + ConvNeXt + YOLO26 WBF ensemble (≈ 0.42 on the 36-img held-out, +0.038 over v7).** ConvNeXt is the big additive win (small-object recall); YOLO26 is a marginal third (+0.006, different axis). Architecture diversity in WBF is the one ensemble pattern that helped instead of hurting (cf. v7+v6, two RF-DETRs, which *hurt*).
-3. **Augmentation (DG photometric, fisheye, night) is neutral-to-negative** for cross-city here — consistent with the diagnosis that the failure is *scale / small-object*, not appearance.
-4. **DINOv3 is not worth it — as a single model OR in the ensemble.** As a single model the transplant underperforms (no co-trained DINOv3-RF-DETR pretrain). In the ensemble it adds only +0.002 *despite* being the strongest of the three add-ons standalone (solo 0.317) — because it shares v7's RF-DETR head, its errors are correlated and WBF gains little. The clean lesson: **ensemble value = architectural diversity, not member strength** (weaker-but-diverse YOLO/ConvNeXt each add more than stronger-but-correlated DINOv3).
-5. **The mAP is bottlenecked by small/rare classes (Person ~0.10, Bicycle ~0.18).** Resolution and the ConvNeXt ensemble are the two things that have moved this; pure-appearance techniques (incl. CD-FKD v12) have not.
+1. **Best single model: v16 — RF-DETR DINOv2 @ 1120 + multi-scale (Dima), EMA 0.389.** The resolution ladder 896→1024→1120 = 0.354→0.376→0.389 with diminishing returns; 1120 is the practical ceiling. Resolution/scale is the only training lever that has clearly helped.
+2. **Best overall: v16(native+flip) + ConvNeXt(0.7) + YOLO26(0.3) + VFNet(0.3–0.5) WBF = 0.436 local (+0.056 over single v7, +0.05 over single v16).** v7 is subsumed and dropped. ConvNeXt and VFNet are the diverse work-horses; YOLO26 marginal but non-negative.
+3. **Two refined ensemble laws (both measured):** (a) *diversity must lie along the failure axis* — resolution diversity (v16@1120 vs v7@896) added +0.014 where same-res same-arch (v6) hurt and same-head (DINOv3) added ~0; (b) *every member enters the pool with ≥2 views* (native+flip) — a single disagreeing view dilutes WBF (v16 1-view: −0.021; 2-view: +0.014).
+4. **VFNet vs DINOv3 — the two mirror experiments on member value.** DINOv3: strong solo (0.317), correlated head → +0.002 (not worth it). VFNet: weak solo (0.235) but top recall of all members (small 45.2%) + 19 unique TP → +0.005 and the best-composition member (worth it). **Ensemble value = decorrelated *recall*, not solo mAP.**
+5. **Augmentation (DG photometric, fisheye, night) is neutral-to-negative** for cross-city here — consistent with the diagnosis that the failure is *scale / small-object*, not appearance.
+6. **The remaining wall is Person + rare truck subtypes** (shared blind spot 19% of GT, mostly Person at 75% class-miss). No detector family fixes it — it is a class-imbalance training problem, out of ensemble reach.
 
 ## Provenance / caveats
 

@@ -1,0 +1,25 @@
+# Files excluded from trainer.zip (hafnia trainer create-zip). .gitignore syntax.
+# NOTE: weights/cascade_convnext_bdd_slim.pth (~292 MB) is intentionally KEPT — the network-isolated
+# runtime cannot download it, so it must ship inside the zip.
+
+# hafnia defaults (kept explicit)
+*.jpg
+*.png
+*.py[cod]
+*_cache/
+**.egg-info/
+.data
+.git
+.venv
+.vscode
+__pycache__
+trainer.zip
+tests
+wandb
+
+# project-specific
+.gitignore
+README.md
+work_dirs/
+# the original 875 MB checkpoint must never end up in the zip — we ship the slimmed copy instead
+weights/cascade_rcnn_convnext-s_fpn_fp16_3x_det_bdd100k.pth
