@@ -2,6 +2,10 @@
 .data/
 trainer.zip
 weights/
+artifacts/
+
+# Large prediction artifacts (too big for GitHub's 100MB limit)
+predictions_test.json
 
 # Build artefacts
 state.json

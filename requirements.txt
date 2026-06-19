@@ -4,10 +4,16 @@ hafnia>=0.7.9
 # RF-DETR is installed from the local ./rf-detr folder via the Dockerfile.
 # Listing its runtime deps explicitly so `pip install -r requirements.txt` also works.
 torch>=2.2.0,<2.11
-torchvision>=0.17.0
-# >=5.9.0 required for the DINOv3 ViT backbone (DINOv3ViTBackbone/DINOv3ViTConfig) used by the
-# dinov3_* encoder path; 5.9.0 is the version verified locally (scripts/check_dinov3_warmstart.py).
-transformers>=5.9.0,<6.0.0
+# Cap below the torch-2.7 era: torchvision 0.22+ (paired with torch 2.7) references dtypes the
+# 2.5.1 base image lacks. Base image ships 0.20.x, which this range keeps.
+torchvision>=0.17.0,<0.21
+# PINNED EXACT (do not loosen): newer transformers patches in the 5.9.x/5.10 line import
+# `torch.float8_e8m0fnu` at module load (transformers/integrations/finegrained_fp8.py), a dtype
+# added only in torch 2.7 — the 2.5.1 base image has no such attribute, so any rebuild that lets
+# pip drift to those versions dies at `from rfdetr import ...` with AttributeError (this killed
+# rfdetr_large_hires1120_ms_v16). 5.9.0 is the verified floor and predates that import; it still
+# provides the DINOv3 ViT backbone (DINOv3ViTBackbone/DINOv3ViTConfig) for the dinov3_* encoder.
+transformers==5.9.0
 pytorch_lightning>=2.6,<3,!=2.6.2,!=2.6.3
 torchmetrics[detection]>=1.2
 supervision>=0.20
@@ -15,8 +21,13 @@ pydantic>=2.0
 pyDeprecate
 peft
 pycocotools
-# >=2.0 for OpticalDistortion(mode="fisheye") used by the fisheye_night aug preset (verified on 2.0.8).
-albumentations>=2.0.0
+# PINNED EXACT: 2.0.8 is the verified version (fisheye_night preset uses OpticalDistortion(mode="fisheye")).
+albumentations==2.0.8
+# Transitive dep of albucore/albumentations. PINNED because the latest release (4.6.x) ships
+# source-only for this platform -> pip tries to compile -> `gcc: No such file or directory` ->
+# BUILD_FAILED on the platform (killed rfdetr_large_hires1408_ms_bs1_v21). 3.12.6 has manylinux
+# wheels and satisfies albucore's `stringzilla>=3.10.4`.
+stringzilla==3.12.6
 tensorboard
 wandb
 

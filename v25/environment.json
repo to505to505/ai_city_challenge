@@ -1,0 +1,10 @@
+{
+  "timestamp": "2026-06-12T23:39:32.864576",
+  "python_version": "3.11.10 | packaged by conda-forge | (main, Oct 16 2024, 01:27:36) [GCC 13.3.0]",
+  "python_executable": "/opt/conda/bin/python",
+  "os": "Linux",
+  "os_release": "5.10.252-250.1005.amzn2.x86_64",
+  "cpu_count": 4,
+  "cuda_version": "N/A",
+  "cudnn_version": "N/A"
+}

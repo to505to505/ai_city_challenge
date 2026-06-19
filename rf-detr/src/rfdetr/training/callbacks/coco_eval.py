@@ -155,6 +155,12 @@ class COCOEvalCallback(Callback):
             batch: The device-transferred batch ``(samples, targets)``.
             batch_idx: Batch index within the validation epoch.
         """
+        # PTL's pre-fit sanity check runs the validation hooks on num_sanity_val_steps (=2) batches.
+        # Accumulating those 2 images would yield a meaningless "mAP over 2 images" — which then
+        # poisoned BestModelCallback: it announced e.g. "Best EMA mAP 0.4754 (epoch 0)" from 2 sanity
+        # images, and real epochs (lower, honest values) never published a best checkpoint again.
+        if trainer.sanity_checking:
+            return
         preds: list[dict[str, torch.Tensor]] = self._convert_preds(outputs["results"])
         targets = self._convert_targets(outputs["targets"])
 
@@ -193,6 +199,14 @@ class COCOEvalCallback(Callback):
             trainer: The PTL Trainer.
             pl_module: The LightningModule.
         """
+        # Skip the pre-fit sanity check entirely: nothing was accumulated (batch hook also skips),
+        # and computing/logging here would publish a fake "epoch 0" mAP into callback_metrics.
+        if trainer.sanity_checking:
+            self.map_metric.reset()
+            if self.map_metric_ema is not None:
+                self.map_metric_ema.reset()
+            self._f1_local = init_matching_accumulator()
+            return
         if self._eval_interval > 1:
             current_epoch = int(getattr(trainer, "current_epoch", 0)) + 1
             max_epochs = getattr(trainer, "max_epochs", None)

@@ -292,6 +292,12 @@ class BestModelCallback(ModelCheckpoint):
         # Stash before the skip guard — eligible epochs still need this reference
         # inside _save_checkpoint (which receives no pl_module param).
         self._current_pl_module = pl_module
+        # Never track "best" from the pre-fit sanity check: its 2-image mAP is meaningless, and once
+        # recorded as best (e.g. 0.4754) no honest epoch could beat it — the run would then never
+        # publish a real best checkpoint. The PTL parent guards this internally; the custom EMA
+        # tracking below did not, so guard explicitly.
+        if trainer.sanity_checking:
+            return
         if trainer.current_epoch < self._skip_best_epochs:
             return
         # Guard: only run checkpoint logic when the monitored metric was actually

@@ -663,7 +663,15 @@ class RFDETR:
         if _devices is not None:
             trainer_kwargs["devices"] = _devices
         trainer = build_trainer(config, self.model_config, **trainer_kwargs)
-        trainer.fit(module, datamodule, ckpt_path=config.resume or None)
+        if config.epochs == 0:
+            # Eval-only ("0 epochs = pure inference"): the init/pretrain weights are already loaded
+            # into `module.model` (with PE interpolated to the requested resolution), so just run the
+            # validation loop — COCOEvalCallback computes and logs val/mAP exactly as during training.
+            # We deliberately skip fit() because there is nothing to train and configure_optimizers
+            # would otherwise run; validate() never builds an optimizer.
+            trainer.validate(module, datamodule)
+        else:
+            trainer.fit(module, datamodule, ckpt_path=config.resume or None)
 
         # Sync the trained weights back so predict() / export() see the updated model.
         self.model.model = module.model

@@ -5,12 +5,14 @@
 # ------------------------------------------------------------------------
 """LightningDataModule for RF-DETR dataset construction and loaders."""
 
-from typing import Any, List, Optional, Tuple
+import math
+from collections import Counter
+from typing import Any, List, Optional, Set, Tuple
 
 import torch
 import torch.utils.data
 from pytorch_lightning import LightningDataModule
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from rfdetr._namespace import _namespace_from_configs
 from rfdetr.config import ModelConfig, TrainConfig
@@ -131,6 +133,101 @@ def _resolve_augmentation_backend(backend: str) -> str:
         return "gpu"
     except ImportError:
         return "cpu"
+
+
+def repeat_factor_category_factors(
+    per_image_categories: List[Set[int]],
+    thresh: float = 0.001,
+    max_factor: float = 20.0,
+) -> "dict[int, tuple[int, float, float]]":
+    """Per-category RFS diagnostics: ``{category: (image_count, image_freq, repeat_factor)}``.
+
+    For each category ``c`` returns how many images contain it, its image-frequency ``f_c``, and the
+    LVIS category repeat factor ``r_c = clamp(sqrt(thresh / f_c), 1, max_factor)``.  Used both to build
+    the per-image weights (:func:`repeat_factor_weights`) and to log the long-tail picture so ``thresh``
+    can be tuned — a category with ``repeat_factor == 1.0`` is not being oversampled at all.
+
+    Args:
+        per_image_categories: For each image, the set of contiguous class labels present.
+        thresh: Frequency threshold ``t``; only categories with ``f_c < thresh`` get ``r_c > 1``.
+        max_factor: Upper clamp on the repeat factor.
+
+    Returns:
+        Mapping from category label to ``(image_count, image_freq, repeat_factor)``.  Empty when there
+        are no images.
+    """
+    n_images = len(per_image_categories)
+    if n_images == 0:
+        return {}
+
+    cat_image_count: "Counter[int]" = Counter()
+    for cats in per_image_categories:
+        for c in cats:
+            cat_image_count[c] += 1
+
+    stats: "dict[int, tuple[int, float, float]]" = {}
+    for c, count in cat_image_count.items():
+        freq = count / n_images
+        factor = min(max_factor, max(1.0, math.sqrt(thresh / freq)))
+        stats[c] = (count, freq, factor)
+    return stats
+
+
+def repeat_factor_weights(
+    per_image_categories: List[Set[int]],
+    thresh: float = 0.001,
+    max_factor: float = 20.0,
+) -> List[float]:
+    """Compute LVIS Repeat-Factor Sampling image-level repeat factors.
+
+    Implements the image resampling scheme from LVIS (Gupta et al., CVPR 2019, arXiv:1908.03195),
+    matching the ``ClassBalancedDataset`` / ``RepeatFactorTrainingSampler`` formulation used by
+    MMDetection and Detectron2.  For each category ``c`` the image-frequency ``f_c`` is the fraction
+    of images that contain it; the category repeat factor is ``r_c = clamp(sqrt(thresh / f_c), 1, max_factor)``
+    and the per-image factor is the max over the categories present (the rarest category dominates).
+    Images with no annotations get factor ``1.0`` (never up-weighted).
+
+    These factors are used as per-image weights for a ``WeightedRandomSampler`` so that frames
+    containing rare classes are sampled more often — giving the DETR Hungarian matcher far more
+    positive matches per epoch for the long-tail classes whose embeddings otherwise barely move.
+
+    Args:
+        per_image_categories: For each image (in dataset ``__getitem__`` order) the set of
+            contiguous class labels present in that image.
+        thresh: Frequency threshold ``t``.  Only categories with ``f_c < thresh`` are up-weighted.
+            The LVIS default is ``0.001``; raise it for datasets with few classes/images.
+        max_factor: Upper clamp on the per-category (and hence per-image) repeat factor.
+
+    Returns:
+        A list of per-image weights, same length and order as ``per_image_categories``.
+    """
+    cat_factor = {
+        c: factor
+        for c, (_, _, factor) in repeat_factor_category_factors(per_image_categories, thresh, max_factor).items()
+    }
+    return [max((cat_factor[c] for c in cats), default=1.0) for cats in per_image_categories]
+
+
+def aligned_num_samples(weights: List[float], effective_batch_size: int, override: int = 0) -> int:
+    """Pick ``num_samples`` for the weighted sampler, floored to a multiple of ``effective_batch_size``.
+
+    Keeping the per-epoch sample count an exact multiple of ``batch_size * grad_accum_steps`` means
+    ``drop_last=True`` never fires the optimizer on a partial gradient-accumulation window — the same
+    invariant :class:`GradAccumAlignedDataset` enforces for the shuffled path.
+
+    Args:
+        weights: Per-image repeat-factor weights.  ``sum(weights)`` is the natural (full-RFS) epoch
+            size when *override* is not given.
+        effective_batch_size: ``batch_size * grad_accum_steps`` (per process).
+        override: When ``> 0``, target this many samples per epoch instead of ``sum(weights)``
+            (use it to cap the ~2-3x epoch growth that full RFS introduces).
+
+    Returns:
+        ``num_samples`` — a positive multiple of *effective_batch_size* (at least one batch).
+    """
+    target = override if override > 0 else round(sum(weights))
+    aligned = (target // effective_batch_size) * effective_batch_size
+    return max(effective_batch_size, aligned)
 
 
 class RFDETRDataModule(LightningDataModule):
@@ -261,6 +358,42 @@ class RFDETRDataModule(LightningDataModule):
         effective_batch_size = batch_size * self.train_config.grad_accum_steps
         num_workers = self._num_workers
 
+        # Repeat-Factor Sampling: oversample frames containing rare classes (LVIS). Takes precedence
+        # over both the small-dataset and aligned-shuffle paths because the WeightedRandomSampler's
+        # num_samples (kept a multiple of effective_batch_size) handles length/alignment itself, so no
+        # GradAccumAlignedDataset wrapper is needed. Single-GPU only injects this sampler directly; for
+        # DDP the trainer must set use_distributed_sampler=False (RFS is a single-GPU Lite feature here).
+        if getattr(self.train_config, "rfs", False):
+            weights = self._compute_repeat_factor_weights()
+            num_samples = aligned_num_samples(
+                weights, effective_batch_size, override=self.train_config.rfs_num_samples
+            )
+            logger.info(
+                "RFS enabled: %d weighted samples/epoch over %d images "
+                "(effective_batch_size=%d, thresh=%g, max=%g)",
+                num_samples,
+                len(dataset),
+                effective_batch_size,
+                self.train_config.rfs_thresh,
+                self.train_config.rfs_max,
+            )
+            sampler = WeightedRandomSampler(
+                weights=torch.as_tensor(weights, dtype=torch.double),
+                num_samples=num_samples,
+                replacement=True,
+            )
+            return DataLoader(
+                dataset,
+                batch_size=batch_size,
+                sampler=sampler,
+                drop_last=True,
+                collate_fn=self._collate_fn,
+                num_workers=num_workers,
+                pin_memory=self._pin_memory,
+                persistent_workers=self._persistent_workers,
+                prefetch_factor=self._prefetch_factor,
+            )
+
         if len(dataset) < effective_batch_size * _MIN_TRAIN_BATCHES:
             logger.info(
                 "Training with uniform sampler because dataset is too small: %d < %d",
@@ -301,6 +434,69 @@ class RFDETRDataModule(LightningDataModule):
             persistent_workers=self._persistent_workers,
             prefetch_factor=self._prefetch_factor,
         )
+
+    def _compute_repeat_factor_weights(self) -> List[float]:
+        """Build per-image LVIS repeat-factor weights for the training dataset.
+
+        Reads category presence per image from the COCO API object exposed by :class:`CocoDetection`
+        (``self._dataset_train.coco``), in ``self._dataset_train.ids`` order so the weights align with
+        the dataset's ``__getitem__`` indices.  Sparse COCO ``category_id`` values are mapped to
+        contiguous labels via ``cat2label`` when present.  Crowd annotations are ignored.
+
+        Returns:
+            One weight per training image, aligned to the dataset's sample order.
+
+        Raises:
+            ValueError: If the training dataset does not expose a ``.coco`` COCO API object.
+        """
+        dataset = self._dataset_train
+        coco = getattr(dataset, "coco", None)
+        ids = getattr(dataset, "ids", None)
+        if coco is None or ids is None:
+            raise ValueError(
+                "RFS (rfs=True) requires a COCO-style training dataset exposing '.coco' and '.ids'; "
+                f"got {type(dataset).__name__}."
+            )
+        cat2label = getattr(dataset, "cat2label", None)
+
+        per_image_categories: List[Set[int]] = []
+        for image_id in ids:
+            anns = coco.loadAnns(coco.getAnnIds(imgIds=image_id))
+            categories: Set[int] = set()
+            for ann in anns:
+                if ann.get("iscrowd", 0) == 1:
+                    continue
+                category_id = ann["category_id"]
+                if cat2label is not None:
+                    category_id = cat2label.get(category_id, category_id)
+                categories.add(category_id)
+            per_image_categories.append(categories)
+
+        thresh = self.train_config.rfs_thresh
+        max_factor = self.train_config.rfs_max
+        weights = repeat_factor_weights(per_image_categories, thresh=thresh, max_factor=max_factor)
+
+        # Diagnostic: print the long-tail picture and per-class repeat factors so rfs_thresh can be
+        # tuned. A class with repeat_factor == 1.0 is NOT being oversampled (thresh is below its
+        # image-frequency); raise --rfs-thresh until the rare classes you care about get factor > 1.
+        stats = repeat_factor_category_factors(per_image_categories, thresh=thresh, max_factor=max_factor)
+        # Map contiguous labels back to human-readable class names via the COCO API when possible.
+        label_to_name: dict = {}
+        cats_meta = getattr(coco, "cats", None)
+        if cat2label is not None and isinstance(cats_meta, dict):
+            id_to_name = {cid: cats_meta[cid].get("name", str(cid)) for cid in cats_meta}
+            label_to_name = {label: id_to_name.get(cid, str(cid)) for cid, label in cat2label.items()}
+        oversample = sum(weights) / len(weights) if weights else 1.0
+        logger.info(
+            "RFS per-class repeat factors (thresh=%g, max=%g) over %d images — epoch oversample N/M=%.3f:",
+            thresh, max_factor, len(per_image_categories), oversample,
+        )
+        for label, (count, freq, factor) in sorted(stats.items(), key=lambda kv: kv[1][2], reverse=True):
+            name = label_to_name.get(label, str(label))
+            flag = "" if factor > 1.0 else "   (not oversampled — raise --rfs-thresh)"
+            logger.info("  %-28s images=%6d  freq=%.4f  repeat=%.2f%s", name, count, freq, factor, flag)
+
+        return weights
 
     def val_dataloader(self) -> DataLoader:
         """Return the validation DataLoader.

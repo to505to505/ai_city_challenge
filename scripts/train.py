@@ -22,7 +22,7 @@ import random
 import shutil
 import sys
 import threading
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -193,19 +193,76 @@ def reassign_splits_by_camera(dataset: HafniaDataset, val_fraction: float, seed:
     return out
 
 
+def reassign_splits_stratified(dataset: HafniaDataset, val_fraction: float, seed: int) -> HafniaDataset:
+    """Stratified-per-camera split for the FINAL (submission) model: every camera/view stays in TRAIN,
+    and only a small ``val_fraction`` of each camera's frames is sampled into validation.
+
+    Unlike :func:`reassign_splits_by_camera` (leave-camera-out, DG-honest, smaller train), this
+    MAXIMIZES train size and guarantees the model sees ALL views during training. Trade-off: the
+    resulting val mAP is *same-camera* (optimistic) and is only a checkpoint-selection signal, NOT a
+    cross-city generalization proxy. Native ``test`` frames (GT withheld) are left untouched.
+
+    Every camera keeps at least one frame in train, so no view is ever fully removed from training.
+    """
+    df = dataset.samples
+    if "camera_info" not in df.columns:
+        print("[split] no camera_info column — keeping native splits")
+        return dataset
+
+    cam = df.select(pl.col("camera_info").struct.field("name")).to_series().to_list()
+    orig = df["split"].to_list()
+    labeled = {"train", "validation"}
+
+    by_cam: dict = defaultdict(list)
+    for i, (c, s) in enumerate(zip(cam, orig)):
+        if s in labeled and c is not None:
+            by_cam[c].append(i)
+
+    rng = random.Random(seed)
+    val_idx: set = set()
+    for c, idxs in by_cam.items():
+        if len(idxs) <= 1:
+            continue  # single-frame camera -> keep entirely in train (view must stay in train)
+        k = min(round(len(idxs) * val_fraction), len(idxs) - 1)  # always leave >=1 frame in train
+        order = list(idxs)
+        rng.shuffle(order)
+        val_idx.update(order[:k])
+
+    new_split = [
+        ("validation" if i in val_idx else "train") if s in labeled else s
+        for i, s in enumerate(orig)
+    ]
+    out = dataset.update_samples(df.with_columns(pl.Series(new_split).alias("split")))
+
+    counts = Counter(new_split)
+    print(f"[split] stratified-per-camera (seed={seed}, val_fraction={val_fraction}): "
+          f"all {len(by_cam)} cameras kept in train; val sampled within cameras")
+    print(f"[split] new split counts: {dict(counts)}")
+    return out
+
+
 def export_hafnia_to_coco(dataset_name: str, version: str, out_dir: Path,
-                          val_camera_frac: float, split_seed: int) -> Path:
-    """Export HafniaDataset to Roboflow-style COCO on disk, idempotent."""
+                          val_camera_frac: float, split_seed: int, split_mode: str = "camera_out") -> Path:
+    """Export HafniaDataset to Roboflow-style COCO on disk, idempotent.
+
+    ``split_mode`` selects how the labeled frames are re-split:
+    - ``camera_out`` (default): leave-camera-out, DG-honest (held-out cameras absent from train).
+    - ``stratified``: per-camera stratified, all cameras in train, bigger train (final-model mode).
+    - ``native``: keep the dataset's native split (also shares cameras between train and val).
+    ``val_camera_frac`` is the held-out fraction (of cameras for camera_out, of frames for stratified).
+    """
     sentinel = out_dir / "train" / "_annotations.coco.json"
     if sentinel.exists():
         print(f"[data] reusing cached COCO dataset at {out_dir}")
         return out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     dataset = load_hafnia_dataset(dataset_name, version)
-    if val_camera_frac and val_camera_frac > 0:
-        dataset = reassign_splits_by_camera(dataset, val_camera_frac, split_seed)
+    if split_mode == "native" or not (val_camera_frac and val_camera_frac > 0):
+        print("[split] using native dataset splits (cameras shared between train/val -> all views in train)")
+    elif split_mode == "stratified":
+        dataset = reassign_splits_stratified(dataset, val_camera_frac, split_seed)
     else:
-        print("[split] --val-camera-frac<=0 — using native dataset splits")
+        dataset = reassign_splits_by_camera(dataset, val_camera_frac, split_seed)
     print(f"[data] exporting to roboflow COCO layout at {out_dir}")
     dataset.to_coco_format(out_dir, coco_format_type="roboflow")
     return out_dir
@@ -216,6 +273,70 @@ BEST_CKPT_FILES = (
     "checkpoint_best_ema.pth",
     "checkpoint_best_regular.pth",
 )
+
+
+def _to_bbox_primitives(predictions, image_shape, bbox_task):
+    """Convert supervision Detections -> list[Bbox] with NORMALIZED coords (mirrors the official
+    trainer-object-detection reference). image_shape = (H, W). Drops the n+1-th "background" class."""
+    from hafnia.dataset.primitives import Bbox
+
+    out = []
+    for bbox, class_idx, confidence in zip(predictions.xyxy, predictions.class_id, predictions.confidence):
+        if int(class_idx) == len(bbox_task.classes):  # n+1-th index = "no object" / background
+            continue
+        out.append(
+            Bbox(
+                height=float((bbox[3] - bbox[1]) / image_shape[0]),
+                width=float((bbox[2] - bbox[0]) / image_shape[1]),
+                top_left_x=float(bbox[0] / image_shape[1]),
+                top_left_y=float(bbox[1] / image_shape[0]),
+                class_idx=int(class_idx),
+                class_name=bbox_task.classes[int(class_idx)].name,
+                confidence=float(confidence),
+                ground_truth=False,
+            )
+        )
+    return out
+
+
+def run_test_predictions(model, dataset, logger, threshold: float) -> None:
+    """Run inference on the TEST split and save predictions in the Hafnia submission format.
+
+    This replicates the official ``trainer-object-detection`` reference: build a HafniaDataset with
+    predicted ``Bbox`` primitives (``ground_truth=False``) and persist it with
+    ``write_annotations(logger._path_artifacts())`` — i.e. ``annotations.parquet`` + ``dataset_info.json``
+    keyed by ``remote_path``, written to ``/opt/ml/output/data``. The platform scorer reads THAT — a
+    COCO-results JSON in ``/opt/ml/model`` is the wrong format AND the wrong location.
+    """
+    from hafnia.dataset.benchmark.benchmark import run_inference_on_dataset
+    from hafnia.dataset.benchmark.inference_model import InferenceModel
+    from hafnia.dataset.dataset_names import SampleField, SplitName
+    from hafnia.dataset.hafnia_dataset_types import ModelInfo
+    from hafnia.dataset.primitives import Bbox
+
+    task_info = dataset.info.get_tasks_by_primitive(Bbox)[0]
+    dataset_test = dataset.create_split_dataset(split_name=SplitName.TEST)
+    print(f"[predict-test] test split: {len(dataset_test)} samples; task='{task_info.name}', threshold={threshold}")
+
+    class _Wrap(InferenceModel):
+        def __init__(self, m, task, thr):
+            self.model, self.task, self.thr = m, task, thr
+
+        def get_model_info(self):
+            return ModelInfo(name=self.model.__class__.__name__, tasks=[self.task])
+
+        def predict(self, images, sample_dict=None):
+            dets = self.model.predict(images, threshold=self.thr)
+            return _to_bbox_primitives(dets, images.shape[:2], self.task)
+
+    preds = run_inference_on_dataset(dataset=dataset_test, model=_Wrap(model, task_info, threshold))
+
+    out = logger._path_artifacts()
+    Path(out).mkdir(parents=True, exist_ok=True)
+    drop = [SampleField.FILE_PATH, SampleField.VIDEO_INFO, SampleField.CAMERA_INFO, SampleField.META]
+    preds.samples = preds.samples.drop(drop, strict=False)
+    preds.write_annotations(out)
+    print(f"[predict-test] wrote Hafnia annotations (remote_path + predicted bboxes) -> {out}")
 
 
 def _capture_mlflow_run_id() -> Optional[str]:
@@ -471,6 +592,14 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--split-seed", type=int, default=42, help="seed for which cameras are held out")
     p.add_argument(
+        "--split-mode",
+        choices=["camera_out", "stratified", "native"],
+        default="camera_out",
+        help="camera_out = leave-camera-out (DG-honest, smaller train, default); "
+             "stratified = per-camera split keeping ALL views in train with a small val (biggest "
+             "train — for the FINAL submission model); native = dataset's native split.",
+    )
+    p.add_argument(
         "--aug-preset",
         choices=["baseline", "dg", "fisheye_night"],
         default="baseline",
@@ -504,6 +633,13 @@ def parse_args() -> argparse.Namespace:
         help="wider multi-scale range (even more VRAM; use only with small --batch-size).",
     )
     p.add_argument(
+        "--letterbox",
+        action="store_true",
+        help="resize preserving aspect ratio (longest side -> --resolution) and pad to a square with "
+             "centered gray bars, instead of squashing into a square. Avoids distorting objects "
+             "(esp. tall/thin like Person and portrait frames); costs ~padding compute.",
+    )
+    p.add_argument(
         "--cd-fkd",
         action="store_true",
         help="CD-FKD self-distillation for domain generalization: per step, run the backbone on a CLEAN "
@@ -516,11 +652,41 @@ def parse_args() -> argparse.Namespace:
                    help="student view is downscaled to U(min_scale,1.0)x then back up (small-object simulation)")
     p.add_argument("--cd-fkd-noise-std", type=float, default=0.05,
                    help="gaussian-noise std (normalized-image space) added to the corrupted student view")
+    p.add_argument(
+        "--rfs",
+        action="store_true",
+        help="LVIS Repeat-Factor Sampling: oversample frames containing rare classes via a "
+             "WeightedRandomSampler so the DETR matcher gets far more positive matches per epoch for "
+             "the long tail (Person/Bicycle/Motorcycle/HeavyDuty). Targets per-class AP, not overall mAP.",
+    )
+    p.add_argument("--rfs-thresh", type=float, default=0.001,
+                   help="RFS frequency threshold t; only classes appearing in < t of images are up-weighted. "
+                        "LVIS default 0.001; with only 10 classes you likely need higher (e.g. 0.01-0.1).")
+    p.add_argument("--rfs-max", type=float, default=20.0,
+                   help="RFS clamp on the per-image repeat factor (caps how hard a rare frame is oversampled).")
+    p.add_argument("--rfs-num-samples", type=int, default=0,
+                   help="RFS samples per epoch (0 = auto = sum of repeat factors, ~2-3x dataset). "
+                        "Set a value to cap epoch length / training time.")
+    p.add_argument(
+        "--freeze-encoder",
+        action="store_true",
+        help="Freeze the DINOv2 backbone (requires_grad=False on all encoder params): train only "
+             "projector + decoder + heads. Frees VRAM/compute and avoids further source-overfit of the "
+             "backbone — sensible when warm-starting from a checkpoint already fine-tuned on this data "
+             "(e.g. v28). NOTE: --lr-encoder becomes a no-op (no encoder params get updated).",
+    )
     # NOTE: Hafnia Training-aaS containers are network-isolated — wandb.ai is unreachable.
     # Keep --wandb only for local runs. HafniaLogger writes via the platform's VPC MLflow.
     p.add_argument("--wandb", action="store_true", help="local only — W&B is blocked in Hafnia cloud")
     p.add_argument("--wandb-project", default="eccv-cross-city")
     p.add_argument("--run-name", default=None, help="W&B run name (also used as the experiment name)")
+    p.add_argument("--predict-test", action="store_true",
+                   help="After (0-epoch) eval, run inference on the unlabeled TEST split and write a "
+                        "COCO-format predictions_test.json to the experiment outputs (for submission).")
+    p.add_argument("--predict-threshold", type=float, default=0.05,
+                   help="Min confidence kept when writing test predictions (low = higher recall for mAP).")
+    p.add_argument("--predict-batch", type=int, default=8,
+                   help="Images per inference batch for --predict-test (keep small on a 16 GB T4).")
     p.add_argument(
         "--stream-interval",
         type=float,
@@ -553,6 +719,7 @@ def main() -> None:
             "val_camera_frac": args.val_camera_frac,
             "split_seed": args.split_seed,
             "aug_preset": args.aug_preset,
+            "letterbox": args.letterbox,
             "init_weights": args.init_weights,
             "multi_scale": args.multi_scale,
             "expanded_scales": args.expanded_scales,
@@ -560,6 +727,11 @@ def main() -> None:
             "cd_fkd_alpha": args.cd_fkd_alpha,
             "cd_fkd_min_scale": args.cd_fkd_min_scale,
             "cd_fkd_noise_std": args.cd_fkd_noise_std,
+            "rfs": args.rfs,
+            "rfs_thresh": args.rfs_thresh,
+            "rfs_max": args.rfs_max,
+            "rfs_num_samples": args.rfs_num_samples,
+            "freeze_encoder": args.freeze_encoder,
             "augmentations": aug,
         }
     )
@@ -567,11 +739,16 @@ def main() -> None:
     # Keep the COCO cache keyed to the split scheme so leave-camera-out and native
     # exports never collide on disk.
     _base = Path(args.coco_dir)
-    suffix = f"_locamout{args.val_camera_frac:g}_s{args.split_seed}" if args.val_camera_frac > 0 else "_native"
+    if args.split_mode == "stratified":
+        suffix = f"_strat{args.val_camera_frac:g}_s{args.split_seed}"
+    elif args.split_mode == "native" or args.val_camera_frac <= 0:
+        suffix = "_native"
+    else:
+        suffix = f"_locamout{args.val_camera_frac:g}_s{args.split_seed}"
     coco_dir = _base.parent / (_base.name + suffix)
     coco_dir = export_hafnia_to_coco(
         args.dataset_name, args.dataset_version, coco_dir,
-        val_camera_frac=args.val_camera_frac, split_seed=args.split_seed,
+        val_camera_frac=args.val_camera_frac, split_seed=args.split_seed, split_mode=args.split_mode,
     )
 
     # Pick the init checkpoint: --init-weights (warm-start / fine-tune FROM a prior run) wins;
@@ -601,7 +778,8 @@ def main() -> None:
         )
 
     model = RFDETRLarge(
-        num_classes=NUM_CLASSES, resolution=args.resolution, encoder=args.encoder, **pretrain_kwargs
+        num_classes=NUM_CLASSES, resolution=args.resolution, encoder=args.encoder,
+        freeze_encoder=args.freeze_encoder, **pretrain_kwargs
     )
 
     # Resolve once so the watcher and model.train() share the exact same directories.
@@ -652,7 +830,12 @@ def main() -> None:
             cd_fkd_alpha=args.cd_fkd_alpha,
             cd_fkd_min_scale=args.cd_fkd_min_scale,
             cd_fkd_noise_std=args.cd_fkd_noise_std,
+            rfs=args.rfs,
+            rfs_thresh=args.rfs_thresh,
+            rfs_max=args.rfs_max,
+            rfs_num_samples=args.rfs_num_samples,
             square_resize_div_64=True,
+            letterbox=args.letterbox,
             use_ema=True,
             tensorboard=True,
             # RF-DETR defaults train_log_on_step=False → train metrics aggregate to ONE point
@@ -670,6 +853,41 @@ def main() -> None:
         # `stop()` also runs one last tick so partial writes between the final interval
         # and end-of-training still make it into HafniaLogger / path_model().
         watcher.stop()
+
+    # Eval-only run (--epochs 0 = pure inference): validate() writes no checkpoint, so persist the
+    # evaluated weights as the official "Trained model" artifact. This makes a 0-epoch run download-
+    # able like a trained one and lets it complete SUCCEEDED — used to lock in a known-good checkpoint
+    # (e.g. v5 @ R1280, which scored the epoch-0 0.4754) without the degrading fine-tune.
+    if args.epochs == 0 and init_path.exists():
+        import shutil
+
+        model_dir.mkdir(parents=True, exist_ok=True)
+        dst = model_dir / "checkpoint_best_ema.pth"
+        shutil.copy(str(init_path), str(dst))
+        print(f"[eval-only] persisted evaluated weights -> {dst}")
+
+    # Optional: inference on the TEST split -> Hafnia submission annotations (the platform scorer
+    # reads write_annotations() output in /opt/ml/output/data, NOT a COCO JSON in /opt/ml/model).
+    if args.predict_test:
+        # After training, `model.model` holds the LAST epoch's regular weights — but the best
+        # checkpoint (EMA/regular winner picked by BestModelCallback on val mAP) is usually better.
+        # Reload it for inference so the submission comes from the best model, not the final one.
+        # For --epochs 0 the loaded init weights ARE the evaluated model — use them as-is.
+        predict_model = model
+        if args.epochs > 0:
+            best = next((ckpt_dir / f for f in BEST_CKPT_FILES if (ckpt_dir / f).exists()), None)
+            if best is not None:
+                print(f"[predict-test] loading best checkpoint for inference: {best.name}")
+                predict_model = RFDETRLarge(
+                    num_classes=NUM_CLASSES, resolution=args.resolution, encoder=args.encoder,
+                    pretrain_weights=str(best),
+                )
+            else:
+                print("[predict-test] WARNING: no best checkpoint found; predicting with final weights")
+        # The competition TEST split is the dataset's NATIVE test (never touched by any re-split),
+        # so load the raw dataset and predict on its test split directly — independent of split_mode.
+        ds_pred = load_hafnia_dataset(args.dataset_name, args.dataset_version)
+        run_test_predictions(predict_model, ds_pred, logger, args.predict_threshold)
 
     print(f"[done] checkpoints in {ckpt_dir}; trained model in {model_dir}")
 

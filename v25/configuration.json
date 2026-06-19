@@ -1,0 +1,70 @@
+{
+  "project_name": "eccv-cross-city-rfdetr-large",
+  "model": "RFDETRLarge",
+  "encoder": "dinov2_windowed_small",
+  "resolution": 1280,
+  "patch_size": 16,
+  "num_classes": 10,
+  "class_names": [
+    "Vehicle.Car",
+    "Vehicle.Pickup Truck",
+    "Vehicle.Single Truck",
+    "Vehicle.Combo Truck",
+    "Vehicle.Heavy Duty Vehicle",
+    "Vehicle.Trailer",
+    "Vehicle.Motorcycle",
+    "Vehicle.Bicycle",
+    "Vehicle.Van",
+    "Person"
+  ],
+  "epochs": 1,
+  "batch_size": 1,
+  "grad_accum_steps": 8,
+  "lr": 5e-05,
+  "lr_encoder": 7.5e-05,
+  "lr_scheduler": "cosine",
+  "devices": 1,
+  "val_camera_frac": 0.2,
+  "split_seed": 42,
+  "aug_preset": "baseline",
+  "letterbox": false,
+  "init_weights": "weights/v5_best_ema.pth",
+  "multi_scale": true,
+  "expanded_scales": false,
+  "cd_fkd": false,
+  "cd_fkd_alpha": 1.0,
+  "cd_fkd_min_scale": 0.4,
+  "cd_fkd_noise_std": 0.05,
+  "augmentations": {
+    "HorizontalFlip": {
+      "p": 0.5
+    },
+    "RandomBrightnessContrast": {
+      "brightness_limit": 0.15,
+      "contrast_limit": 0.15,
+      "p": 0.4
+    },
+    "ColorJitter": {
+      "brightness": 0.15,
+      "contrast": 0.15,
+      "saturation": 0.15,
+      "hue": 0.05,
+      "p": 0.4
+    },
+    "Affine": {
+      "scale": [
+        0.9,
+        1.1
+      ],
+      "translate_percent": [
+        -0.05,
+        0.05
+      ],
+      "rotate": [
+        -5,
+        5
+      ],
+      "p": 0.3
+    }
+  }
+}

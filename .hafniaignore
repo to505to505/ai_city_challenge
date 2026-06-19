@@ -32,6 +32,28 @@ trainer_instruction.txt
 .vram_probe.py
 state.json
 
+# Separate ConvNeXt/mmdet trainer — packaged on its own from trainer-convnext/, NOT used by this
+# RF-DETR Large trainer (root Dockerfile never COPYs it). It was accidentally swept into trainer.zip
+# before, adding ~145 MB of dead weights + a conflicting second Dockerfile.
+trainer-convnext/
+
+# Non-runtime project material: docs/notes and local API tooling are not needed inside the trainer.
+docs/
+tools/
+
+# Checkpoints/artifacts downloaded back FROM the platform (e.g. artifacts/v20/) — never ship them.
+artifacts/
+
+# Submission files assembled at repo root (predictions + zip) — outputs, never trainer inputs.
+predictions_test.json
+submission_*.zip
+# .tar.gz submission/output bundles the *.zip pattern misses (e.g. submission_v25.tar.gz,
+# outputs-*.tar.gz). No .tar.gz is ever needed at training time, so exclude them all.
+*.tar.gz
+# Downloaded experiment-outputs scratch dir (configuration/environment/experiment.parquet).
+v25/
+*Zone.Identifier
+
 # RF-DETR baggage we never need at training time
 rf-detr/docs/
 rf-detr/notebooks/

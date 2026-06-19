@@ -361,7 +361,7 @@ class RFDETRModelModule(LightningModule):
         )
 
         total_steps = int(self.trainer.estimated_stepping_batches)
-        steps_per_epoch = max(1, total_steps // tc.epochs)
+        steps_per_epoch = max(1, total_steps // max(1, tc.epochs))  # guard epochs=0 (eval-only) against ZeroDivisionError
         warmup_steps = int(steps_per_epoch * tc.warmup_epochs)
 
         def lr_lambda(current_step: int) -> float:

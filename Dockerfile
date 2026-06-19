@@ -8,13 +8,22 @@ FROM pytorch/pytorch:2.5.1-cuda12.1-cudnn9-runtime
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+    # Multi-scale training varies the input size every step, and the val->train phase change
+    # allocates differently-sized blocks; the default caching allocator fragments and then fails a
+    # large contiguous request even when GiBs are free-but-reserved (killed every hires ms run at
+    # the epoch-0/val boundary). expandable_segments lets the allocator grow segments instead.
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     TRAINER_PACKAGE_DIR=/opt/recipe
 
 WORKDIR $TRAINER_PACKAGE_DIR
 
 # System deps used by torchvision / albumentations / pycocotools.
+# build-essential: insurance against pip wheel-drift — when a transitive dep releases without a
+# prebuilt wheel for this platform (stringzilla 4.6.x did), pip falls back to building from source
+# and dies without a compiler (BUILD_FAILED). Costs ~200 MB image, saves the run.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
+        build-essential \
         libgl1 \
         libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*

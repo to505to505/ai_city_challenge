@@ -289,10 +289,28 @@ class ConvertCoco(object):
         return image, target
 
 
+def _pad_to_square(size: int, fill: int = 114) -> Dict[str, Any]:
+    """PadIfNeeded config that pads up to a ``size``x``size`` square with centered constant gray bars.
+
+    Used for letterbox resizing (longest-side resize then pad to square) so aspect ratio is preserved
+    instead of squashed. Handles the albumentations 1.x (``value=``) vs 2.x (``fill=``) API difference.
+    """
+    import albumentations as alb
+
+    params: Dict[str, Any] = {"min_height": size, "min_width": size, "border_mode": 0, "position": "center"}
+    try:  # albumentations >=2.x takes `fill`; <2.x takes `value`
+        alb.PadIfNeeded(min_height=size, min_width=size, border_mode=0, fill=fill, position="center")
+        params["fill"] = fill
+    except TypeError:
+        params["value"] = fill
+    return {"PadIfNeeded": params}
+
+
 def _build_train_resize_config(
     scales: List[int],
     *,
     square: bool,
+    letterbox: bool = False,
     max_size: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Build the training resize pipeline as an Albumentations config list.
@@ -320,7 +338,33 @@ def _build_train_resize_config(
     Returns:
         A single-element list containing a ``OneOf`` config entry.
     """
-    if square:
+    if letterbox:
+        # Aspect-preserving square resize: longest side -> s, then PadIfNeeded to s x s with centered
+        # constant gray bars (clean letterbox, no squash). Option B (square crop) is shared with squash.
+        option_a: Dict[str, Any] = {
+            "OneOf": {
+                "transforms": [
+                    {"Sequential": {"transforms": [{"LongestMaxSize": {"max_size": s}}, _pad_to_square(s)]}}
+                    for s in scales
+                ],
+            }
+        }
+        option_b: Dict[str, Any] = {
+            "Sequential": {
+                "transforms": [
+                    {"SmallestMaxSize": {"max_size": [400, 500, 600]}},
+                    {
+                        "OneOf": {
+                            "transforms": [
+                                {"RandomSizedCrop": {"min_max_height": [384, 600], "height": s, "width": s}}
+                                for s in scales
+                            ],
+                        }
+                    },
+                ]
+            }
+        }
+    elif square:
         option_a: Dict[str, Any] = {
             "OneOf": {
                 "transforms": [{"Resize": {"height": s, "width": s}} for s in scales],
@@ -478,6 +522,7 @@ def make_coco_transforms_square_div_64(
     num_windows: int = 4,
     aug_config: Optional[Dict[str, Dict[str, Any]]] = None,
     gpu_postprocess: bool = False,
+    letterbox: bool = False,
 ) -> Compose:
     """Create COCO transforms with square resizing where the output size is divisible by 64.
 
@@ -528,7 +573,9 @@ def make_coco_transforms_square_div_64(
 
     if image_set == "train":
         resolved_aug_config = aug_config if aug_config is not None else AUG_CONFIG
-        resize_wrappers = AlbumentationsWrapper.from_config(_build_train_resize_config(scales, square=True))
+        resize_wrappers = AlbumentationsWrapper.from_config(
+            _build_train_resize_config(scales, square=True, letterbox=letterbox)
+        )
         pipeline = [*resize_wrappers]
         if not gpu_postprocess:
             aug_wrappers = AlbumentationsWrapper.from_config(resolved_aug_config)
@@ -539,7 +586,11 @@ def make_coco_transforms_square_div_64(
         return Compose(pipeline)
 
     if image_set in ("val", "test", "val_speed"):
-        resize_wrappers = AlbumentationsWrapper.from_config([{"Resize": {"height": resolution, "width": resolution}}])
+        if letterbox:  # aspect-preserving: longest side -> resolution, pad to square (no squash)
+            val_resize_cfg = [{"LongestMaxSize": {"max_size": resolution}}, _pad_to_square(resolution)]
+        else:
+            val_resize_cfg = [{"Resize": {"height": resolution, "width": resolution}}]
+        resize_wrappers = AlbumentationsWrapper.from_config(val_resize_cfg)
         return Compose([*resize_wrappers, to_image, to_float, normalize])
 
     raise ValueError(f"unknown {image_set}")
@@ -643,6 +694,7 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
 
     img_folder, ann_file = PATHS[image_set.split("_")[0]]
     square_resize_div_64 = getattr(args, "square_resize_div_64", False)
+    letterbox = getattr(args, "letterbox", False)
     include_masks = getattr(args, "segmentation_head", False)
     multi_scale = getattr(args, "multi_scale", False)
     expanded_scales = getattr(args, "expanded_scales", False)
@@ -654,7 +706,8 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
     gpu_postprocess = resolved_augmentation_backend != "cpu"
 
     if square_resize_div_64:
-        logger.info(f"Building Roboflow {image_set} dataset with square resize at resolution {resolution}")
+        mode_msg = "letterbox (aspect-preserving) resize" if letterbox else "square resize"
+        logger.info(f"Building Roboflow {image_set} dataset with {mode_msg} at resolution {resolution}")
         dataset = CocoDetection(
             img_folder,
             ann_file,
@@ -668,6 +721,7 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
                 num_windows=num_windows,
                 aug_config=aug_config,
                 gpu_postprocess=gpu_postprocess,
+                letterbox=letterbox,
             ),
             include_masks=include_masks,
             remap_category_ids=True,

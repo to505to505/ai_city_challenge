@@ -627,6 +627,10 @@ class TrainConfig(BaseModel):
     num_select: int = 300
     dataset_file: Literal["coco", "o365", "roboflow", "yolo"] = "roboflow"
     square_resize_div_64: bool = True
+    # When True (with square_resize_div_64), resize preserving aspect ratio (longest side -> resolution)
+    # and pad to a square with centered constant gray bars (letterbox) instead of squashing. Off by
+    # default -> normal square-squash path unchanged.
+    letterbox: bool = False
     dataset_dir: str
     output_dir: str = "output"
     multi_scale: bool = True
@@ -641,6 +645,15 @@ class TrainConfig(BaseModel):
     cd_fkd_alpha: float = 1.0  # weight of the global backbone feature-mimic loss
     cd_fkd_min_scale: float = 0.4  # student view downscaled to U(min_scale,1.0)*size then back up (small-object sim)
     cd_fkd_noise_std: float = 0.05  # gaussian-noise std (normalized-image space) added to the student view
+    # --- RFS: LVIS Repeat-Factor Sampling for long-tail rebalancing ---
+    # When True, the train dataloader uses a WeightedRandomSampler whose per-image weight is the LVIS
+    # image-level repeat factor (rarest category in the image dominates), so frames with rare classes
+    # are sampled more often and the DETR matcher gets far more positive matches per epoch for the
+    # long tail. Off by default → normal shuffled path unchanged.
+    rfs: bool = False
+    rfs_thresh: float = 0.001  # frequency threshold t; only classes with image-freq < t are up-weighted
+    rfs_max: float = 20.0  # clamp on the per-image repeat factor
+    rfs_num_samples: int = 0  # samples/epoch (0 = auto = sum of repeat factors; set to cap epoch growth)
     use_ema: bool = True
     ema_update_interval: int = 1
     num_workers: int = 2
