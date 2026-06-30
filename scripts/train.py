@@ -131,7 +131,51 @@ AUG_FISHEYE_NIGHT = {
     "Affine": {"scale": (0.9, 1.1), "translate_percent": (-0.05, 0.05), "rotate": (-5, 5), "p": 0.3},
 }
 
-AUG_PRESETS = {"baseline": AUG_CONFIG, "dg": AUG_DG, "fisheye_night": AUG_FISHEYE_NIGHT}
+# === Job #1 cross-city stack: Tier1 geometry + Tier2 sensor/weather + coupled day-night ==========
+# Only transforms VERIFIED to build on albumentations 2.0.8 with 2.x param names (a 1.x name like
+# var_limit / quality_lower / scale_min / max_holes builds-but-no-ops SILENTLY — never use them).
+# Dict order == application order (from_config), staged: extra geometry -> photometric ->
+# CoupledDayNight -> sensor noise/blur/compression -> weather -> occlusion. The resize OneOf +
+# --multi-scale already supply base scale/resolution jitter upstream; copy-paste is a __getitem__
+# hook (enable with --copy-paste), and FourierAmplitudeMix is appended only under --fourier-mix.
+AUG_XCITY = {
+    # --- Tier 1 geometry (mild; mounted cams -> no vertical flip; boxes warped by the wrapper) ---
+    "HorizontalFlip": {"p": 0.5},
+    "Affine": {"scale": (0.9, 1.1), "translate_percent": (0.0, 0.05), "rotate": (-8, 8), "shear": (-5, 5), "p": 0.5},
+    "Perspective": {"scale": (0.02, 0.05), "p": 0.3},
+    "GridDistortion": {"num_steps": 5, "distort_limit": 0.1, "p": 0.2},
+    # --- Tier 1 photometric (box-safe pixel ops) ---
+    "RandomBrightnessContrast": {"brightness_limit": 0.2, "contrast_limit": 0.2, "p": 0.5},
+    "ColorJitter": {"brightness": 0.2, "contrast": 0.2, "saturation": 0.2, "hue": 0.05, "p": 0.5},
+    "HueSaturationValue": {"hue_shift_limit": 10, "sat_shift_limit": 20, "val_shift_limit": 10, "p": 0.3},
+    "RandomGamma": {"gamma_limit": (80, 120), "p": 0.3},
+    "RandomToneCurve": {"scale": 0.1, "p": 0.2},
+    "CLAHE": {"clip_limit": 4.0, "tile_grid_size": (8, 8), "p": 0.2},
+    # --- coupled continuous day->evening->night (+ symmetric noon), box-safe custom transform ---
+    "CoupledDayNight": {"p": 0.6, "night_bias": 0.65, "gamma_max": 2.2, "min_mean_luma": 0.06,
+                        "hard_floor": 0.015, "ir_prob": 0.10, "motion_blur_max": 7},
+    # --- Tier 2 sensor (box-safe; 2.x param names) ---
+    "GaussNoise": {"std_range": (0.05, 0.15), "p": 0.3},
+    "ISONoise": {"color_shift": (0.01, 0.05), "intensity": (0.1, 0.5), "p": 0.2},
+    "MotionBlur": {"blur_limit": 7, "p": 0.2},
+    "GaussianBlur": {"blur_limit": (3, 7), "p": 0.2},
+    "ImageCompression": {"quality_range": (50, 90), "p": 0.3},
+    "Downscale": {"scale_range": (0.5, 0.9), "p": 0.2},
+    # --- weather (low p) ---
+    "RandomFog": {"p": 0.1},
+    "RandomShadow": {"p": 0.2},
+    # --- occlusion (box-safe; degenerate boxes filtered downstream) ---
+    "CoarseDropout": {"num_holes_range": (1, 4), "hole_height_range": (8, 32), "hole_width_range": (8, 32), "p": 0.3},
+}
+
+# A/B (merged over AUG_XCITY by --aug-aggressive): stronger perspective/optical/grid distortion.
+AUG_XCITY_AGGRESSIVE_GEOM = {
+    "Perspective": {"scale": (0.05, 0.12), "p": 0.4},
+    "OpticalDistortion": {"distort_limit": 0.2, "p": 0.3},
+    "GridDistortion": {"num_steps": 5, "distort_limit": 0.25, "p": 0.3},
+}
+
+AUG_PRESETS = {"baseline": AUG_CONFIG, "dg": AUG_DG, "fisheye_night": AUG_FISHEYE_NIGHT, "xcity": AUG_XCITY}
 
 
 def load_hafnia_dataset(dataset_name: str, version: str) -> HafniaDataset:
@@ -601,7 +645,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--aug-preset",
-        choices=["baseline", "dg", "fisheye_night"],
+        choices=["baseline", "dg", "fisheye_night", "xcity"],
         default="baseline",
         help="baseline = mild reference augs; dg = stronger photometric+noise (Phase 2); "
              "fisheye_night = fisheye OpticalDistortion (geometric, targets the fisheye cam) + "
@@ -675,6 +719,24 @@ def parse_args() -> argparse.Namespace:
              "backbone — sensible when warm-starting from a checkpoint already fine-tuned on this data "
              "(e.g. v28). NOTE: --lr-encoder becomes a no-op (no encoder params get updated).",
     )
+    # --- cross-city aug stack (Tier 3 copy-paste + Tier 4 Fourier + aggressive-geometry A/B) ---
+    p.add_argument("--copy-paste", action="store_true",
+                   help="Tier 3: paste rare-class crops (built leakage-free from the train split) into "
+                        "train images. Adds boxes; runs before the geometry augs. Use with --aug-preset xcity.")
+    p.add_argument("--copy-paste-max-n", type=int, default=3, help="max instances pasted per image (k~U(1,n))")
+    p.add_argument("--copy-paste-p", type=float, default=0.5, help="probability an image receives any pastes")
+    p.add_argument("--fourier-mix", action="store_true",
+                   help="Tier 4 (A/B): FACT low-freq amplitude mix (phase-preserved -> boxes valid). "
+                        "References drawn from TRAIN images only. OFF by default.")
+    p.add_argument("--fourier-beta", type=float, default=0.05, help="FACT low-freq window ratio (0,0.2]")
+    p.add_argument("--fourier-lambda-max", type=float, default=0.3, help="FACT max mix weight; lam~U(0,this)")
+    p.add_argument("--fourier-p", type=float, default=0.3, help="FACT apply probability per image")
+    p.add_argument("--fourier-ref-split", choices=["train", "test"], default="train",
+                   help="FACT reference source: 'train' = rules-clean cross-camera style; 'test' = FDA "
+                        "toward the hidden TARGET city (strongest, BUT transductive use of test data — "
+                        "verify competition rules; potentially disqualifying).")
+    p.add_argument("--aug-aggressive", action="store_true",
+                   help="A/B: merge stronger perspective/optical/grid distortion over the xcity preset.")
     # NOTE: Hafnia Training-aaS containers are network-isolated — wandb.ai is unreachable.
     # Keep --wandb only for local runs. HafniaLogger writes via the platform's VPC MLflow.
     p.add_argument("--wandb", action="store_true", help="local only — W&B is blocked in Hafnia cloud")
@@ -688,6 +750,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--predict-batch", type=int, default=8,
                    help="Images per inference batch for --predict-test (keep small on a 16 GB T4).")
     p.add_argument(
+        "--pseudo-test-labels",
+        default=None,
+        help="Self-training: path (relative to repo root or absolute) to a slimmed pseudo-label file "
+             "(weights/pseudo_test_labels.json, built by slim_pseudo_predictions.py from the WBF-fused "
+             "ensemble test predictions). The pseudo-labeled TEST images are folded into the COCO "
+             "train/ split as extra TRAIN samples (labeled train stays as the clean anchor). Must be "
+             "bundled under weights/ so it ships in trainer.zip (cloud has no network).",
+    )
+    p.add_argument("--pseudo-threshold", type=float, default=0.5,
+                   help="Min fused ensemble confidence kept as a pseudo-box (must be >= the slim "
+                        "file's floor). 0.5 ≈ 6.9 boxes/img; lower keeps more (noisier) long-tail boxes.")
+    p.add_argument(
         "--stream-interval",
         type=float,
         default=30.0,
@@ -698,7 +772,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    aug = AUG_PRESETS[args.aug_preset]
+    aug = dict(AUG_PRESETS[args.aug_preset])
+    # A/B knobs that mutate the resolved aug dict (order matters: Fourier is appended LAST).
+    if args.aug_aggressive:
+        aug = {**aug, **AUG_XCITY_AGGRESSIVE_GEOM}
+    if args.fourier_mix:
+        aug = {**aug, "FourierAmplitudeMix": {"beta": args.fourier_beta,
+                                              "lambda_max": args.fourier_lambda_max, "p": args.fourier_p}}
 
     logger = HafniaLogger(project_name="eccv-cross-city-rfdetr-large")
     logger.log_configuration(
@@ -732,12 +812,24 @@ def main() -> None:
             "rfs_max": args.rfs_max,
             "rfs_num_samples": args.rfs_num_samples,
             "freeze_encoder": args.freeze_encoder,
+            "copy_paste": args.copy_paste,
+            "copy_paste_max_n": args.copy_paste_max_n,
+            "copy_paste_p": args.copy_paste_p,
+            "fourier_mix": args.fourier_mix,
+            "fourier_beta": args.fourier_beta,
+            "fourier_lambda_max": args.fourier_lambda_max,
+            "fourier_p": args.fourier_p,
+            "fourier_ref_split": args.fourier_ref_split,
+            "aug_aggressive": args.aug_aggressive,
+            "pseudo_test_labels": args.pseudo_test_labels,
+            "pseudo_threshold": args.pseudo_threshold,
             "augmentations": aug,
         }
     )
 
     # Keep the COCO cache keyed to the split scheme so leave-camera-out and native
-    # exports never collide on disk.
+    # exports never collide on disk. A pseudo-label mix gets its OWN suffix so it never
+    # reuses (or pollutes) a plain export's cached tree.
     _base = Path(args.coco_dir)
     if args.split_mode == "stratified":
         suffix = f"_strat{args.val_camera_frac:g}_s{args.split_seed}"
@@ -745,11 +837,44 @@ def main() -> None:
         suffix = "_native"
     else:
         suffix = f"_locamout{args.val_camera_frac:g}_s{args.split_seed}"
+    if args.pseudo_test_labels:
+        suffix += f"_pseudo{args.pseudo_threshold:g}"
     coco_dir = _base.parent / (_base.name + suffix)
+    # Detect a fresh export BEFORE the (idempotent) export call: the pseudo merge mutates
+    # train/_annotations.coco.json in place, so it must run exactly once — only when we just
+    # built the tree, never on a cached reuse (which would double-add the pseudo images).
+    fresh_export = not (coco_dir / "train" / "_annotations.coco.json").exists()
     coco_dir = export_hafnia_to_coco(
         args.dataset_name, args.dataset_version, coco_dir,
         val_camera_frac=args.val_camera_frac, split_seed=args.split_seed, split_mode=args.split_mode,
     )
+
+    # Self-training: fold the ensemble's pseudo-labeled TEST images into train/ as extra samples.
+    if args.pseudo_test_labels:
+        from pseudo_labels import merge_pseudo_test_into_coco  # local module (scripts/ on sys.path)
+
+        pseudo_path = Path(args.pseudo_test_labels)
+        if not pseudo_path.is_absolute():
+            pseudo_path = REPO_ROOT / pseudo_path
+        if not pseudo_path.exists():
+            raise FileNotFoundError(
+                f"--pseudo-test-labels not found at {pseudo_path}. Bundle it under weights/ "
+                "(cloud is network-isolated) and rebuild the trainer."
+            )
+        if not fresh_export:
+            print(f"[pseudo] reusing cached pseudo-merged COCO at {coco_dir} (pseudo already folded in)")
+        else:
+            stats = merge_pseudo_test_into_coco(coco_dir, pseudo_path, args.pseudo_threshold)
+            print(f"[pseudo] merged pseudo-test @thr={args.pseudo_threshold} from {pseudo_path.name}: {stats}")
+            if stats["images_added"] == 0:
+                raise RuntimeError(
+                    "[pseudo] 0 pseudo-test images merged — file_name keys did not match any exported "
+                    f"test image (unmatched={stats['unmatched']}, test_images={stats['test_images']}). "
+                    "The pseudo file_names must match the dataset's test image filenames."
+                )
+            if stats["unmatched"] > stats["images_added"]:
+                print(f"[pseudo] WARNING: more unmatched ({stats['unmatched']}) than matched "
+                      f"({stats['images_added']}) — check the pseudo file_name keying.")
 
     # Pick the init checkpoint: --init-weights (warm-start / fine-tune FROM a prior run) wins;
     # otherwise the bundled COCO-pretrained RF-DETR Large. A warm-start ckpt already has the
@@ -834,6 +959,10 @@ def main() -> None:
             rfs_thresh=args.rfs_thresh,
             rfs_max=args.rfs_max,
             rfs_num_samples=args.rfs_num_samples,
+            copy_paste=args.copy_paste,
+            copy_paste_max_n=args.copy_paste_max_n,
+            copy_paste_p=args.copy_paste_p,
+            fourier_ref_split=args.fourier_ref_split,
             square_resize_div_64=True,
             letterbox=args.letterbox,
             use_ema=True,

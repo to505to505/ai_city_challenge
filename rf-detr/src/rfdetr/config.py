@@ -654,6 +654,16 @@ class TrainConfig(BaseModel):
     rfs_thresh: float = 0.001  # frequency threshold t; only classes with image-freq < t are up-weighted
     rfs_max: float = 20.0  # clamp on the per-image repeat factor
     rfs_num_samples: int = 0  # samples/epoch (0 = auto = sum of repeat factors; set to cap epoch growth)
+    # --- Rare-class copy-paste (Tier 3 cross-city aug). Runs as a CocoDetection.__getitem__ hook on
+    # the TRAIN split, pasting rare-class instance crops (built leakage-free from the train COCO). ---
+    copy_paste: bool = False
+    copy_paste_max_n: int = 3  # max instances pasted per image (k ~ U(1, max_n))
+    copy_paste_p: float = 0.5  # probability an image receives any pastes
+    copy_paste_classes: Optional[List[int]] = None  # contiguous labels; None -> DEFAULT_RARE_LABELS
+    # FourierAmplitudeMix reference source: "train" = rules-clean cross-camera style mixing within
+    # source; "test" = FDA toward the hidden TARGET city (strongest UDA lever, BUT transductive use of
+    # test data -> verify competition rules; potentially disqualifying).
+    fourier_ref_split: str = "train"
     use_ema: bool = True
     ema_update_interval: int = 1
     num_workers: int = 2

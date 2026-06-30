@@ -168,6 +168,12 @@ class CocoDetection(torchvision.datasets.CocoDetection):
     ) -> None:
         super(CocoDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
+        # Optional rare-class copy-paste callable, attached for the TRAIN split only by
+        # build_roboflow_from_coco (None elsewhere -> __getitem__ stays byte-identical to baseline).
+        self.copy_paste = None
+        # TRAIN-split FACT reference dir (set by build_roboflow_from_coco only when FourierAmplitudeMix
+        # is in the aug); __getitem__ re-asserts it so the reference pool is DataLoader-worker-safe.
+        self._fourier_ref_dir = None
         self.include_masks = include_masks
         if remap_category_ids:
             # Mapping from original COCO category_id to contiguous label indices
@@ -182,10 +188,20 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         self.prepare = ConvertCoco(include_masks=include_masks, cat2label=self.cat2label)
 
     def __getitem__(self, idx: int) -> Tuple[Any, Any]:
+        # Re-assert the FACT reference dir inside the worker process (fork/spawn-safe) before any
+        # FourierAmplitudeMix runs. No-op (preserves the cached pool) once set to the same dir.
+        if self._fourier_ref_dir is not None:
+            from rfdetr.datasets.xcity_augs import _ensure_reference_image_dir
+
+            _ensure_reference_image_dir(self._fourier_ref_dir)
         img, target = super(CocoDetection, self).__getitem__(idx)
         image_id = self.ids[idx]
         target = {"image_id": image_id, "annotations": target}
         img, target = self.prepare(img, target)
+        # Rare-class copy-paste runs BEFORE the transform pipeline (boxes are absolute xyxy here) so
+        # pasted instances are warped by the same geometry augs. No-op unless copy_paste is attached.
+        if self.copy_paste is not None:
+            img, target = self.copy_paste(img, target)
         if self._transforms is not None:
             # boxes are absolute [x_min, y_min, x_max, y_max]; conversion to
             # normalized [cx, cy, w, h] occurs inside Normalize
@@ -745,4 +761,61 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
             include_masks=include_masks,
             remap_category_ids=True,
         )
+
+    # Cross-city extras for the TRAIN split only (leakage-free: this img_folder/ann_file is the train
+    # split written AFTER the leave-camera-out re-split, so held-out val cameras are physically absent).
+    if image_set.split("_")[0] == "train":
+        # FACT Fourier reference pool draws style from TRAIN images only (network-free; never val/test).
+        # Only wire it when FourierAmplitudeMix is actually in the aug, and store the dir on the dataset
+        # so __getitem__ re-asserts it inside each DataLoader worker (fork/spawn-safe).
+        _aug_cfg = getattr(args, "aug_config", None)
+        _uses_fourier = (isinstance(_aug_cfg, dict) and "FourierAmplitudeMix" in _aug_cfg) or (
+            isinstance(_aug_cfg, list) and any(isinstance(e, dict) and "FourierAmplitudeMix" in e for e in _aug_cfg)
+        )
+        if _uses_fourier:
+            from rfdetr.datasets.xcity_augs import set_reference_image_dir
+
+            ref_split = getattr(args, "fourier_ref_split", "train")
+            if ref_split == "test":
+                test_dir = root / "test"
+                has_imgs = test_dir.exists() and any(
+                    p.suffix.lower() in {".jpg", ".jpeg", ".png"} for p in test_dir.iterdir()
+                )
+                if has_imgs:
+                    ref_dir = test_dir
+                    logger.warning(
+                        "FACT Fourier references = TEST/TARGET images at %s (FDA toward the hidden city). "
+                        "This is TRANSDUCTIVE use of the test split during training — verify the "
+                        "competition rules permit it; it may be disqualifying.",
+                        test_dir,
+                    )
+                else:
+                    ref_dir = img_folder
+                    logger.warning(
+                        "FACT --fourier-ref-split=test but %s has no images; FALLING BACK to TRAIN refs.",
+                        test_dir,
+                    )
+            else:
+                ref_dir = img_folder
+            dataset._fourier_ref_dir = str(ref_dir)
+            set_reference_image_dir(str(ref_dir))
+            logger.info("FACT Fourier reference pool wired to %s images at %s", ref_split, ref_dir)
+        if getattr(args, "copy_paste", False):
+            from rfdetr.datasets.xcity_augs import DEFAULT_RARE_LABELS, CopyPaste, RareInstanceBank
+
+            rare = getattr(args, "copy_paste_classes", None) or DEFAULT_RARE_LABELS
+            bank = RareInstanceBank(dataset.coco, img_folder, rare, cat2label=dataset.cat2label)
+            if len(bank) > 0:
+                dataset.copy_paste = CopyPaste(
+                    bank,
+                    max_n=getattr(args, "copy_paste_max_n", 3),
+                    p=getattr(args, "copy_paste_p", 0.5),
+                )
+                logger.info(
+                    "copy-paste enabled: rare-instance bank built with %d crops (classes=%s)",
+                    len(bank),
+                    sorted({int(x) for x in rare}),
+                )
+            else:
+                logger.warning("copy-paste requested but the rare-instance bank is empty; disabling")
     return dataset

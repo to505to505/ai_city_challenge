@@ -47,6 +47,10 @@ artifacts/
 # Submission files assembled at repo root (predictions + zip) — outputs, never trainer inputs.
 predictions_test.json
 submission_*.zip
+# Stray ensemble/inference .zip bundles at repo root (the submission_*.zip pattern misses them).
+# No .zip is ever a trainer input — trainer.zip itself is already excluded above.
+inference_ensemble.zip
+*.zip
 # .tar.gz submission/output bundles the *.zip pattern misses (e.g. submission_v25.tar.gz,
 # outputs-*.tar.gz). No .tar.gz is ever needed at training time, so exclude them all.
 *.tar.gz
@@ -75,6 +79,15 @@ weights/PROVENANCE.md
 # ship, so it is intentionally NOT excluded here.
 weights/v6_best_ema.pth
 weights/v6_best_regular_ep3.pth
+
+# Recovered ensemble-MEMBER checkpoints (v16 RF-DETR @1120, VFNet R-50, ConvNeXt-T). Used only to
+# REGENERATE the ensemble's pseudo-labels (offline / in their own mmdet trainers), NOT by the RF-DETR
+# self-training student — which reads the slimmed weights/pseudo_test_labels.json and warm-starts from
+# weights/v28_best_ema.pth. Exclude to keep trainer.zip lean (~580 MB). Recoverable any time from the
+# platform /model artifacts (v16_fixed, vfnet_r50_fpn_eccv_v17b, convnext_v2_v2).
+weights/v16_best_ema.pth
+weights/vfnet_eccv_best.pth
+weights/convnext_dima.pth
 
 # Stray Ultralytics auto-download checkpoints (yolo11l/n/x.pt, yolo26l.pt) that land in the repo
 # root + weights/ during YOLO benchmarking. The RF-DETR DINOv3 run needs none of them (it uses

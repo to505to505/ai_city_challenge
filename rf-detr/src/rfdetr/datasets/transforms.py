@@ -36,6 +36,13 @@ from rfdetr.util.logger import get_logger
 
 logger = get_logger()
 
+# Register the custom cross-city transforms (CoupledDayNight, FourierAmplitudeMix) into the
+# albumentations namespace as an import side effect, so AlbumentationsWrapper.from_config can resolve
+# them by name and DataLoader workers that re-import this module re-register them. Placed here (not in
+# train.py) because coco.py imports this module in every worker process.
+if alb is not None:
+    from rfdetr.datasets import xcity_augs as _xcity_augs  # noqa: F401  (import for registration side effect)
+
 
 class Normalize(object):
     def __init__(

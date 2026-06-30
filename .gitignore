@@ -6,6 +6,8 @@ artifacts/
 
 # Large prediction artifacts (too big for GitHub's 100MB limit)
 predictions_test.json
+inference_ensemble.zip
+*.zip
 
 # Build artefacts
 state.json
